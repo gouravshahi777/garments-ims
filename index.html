@@ -1824,19 +1824,29 @@
         if (detectedFormat && detectedFormat !== uploadFormat) {
           const expected = formatNames[uploadFormat];
           const actual = formatNames[detectedFormat];
-          const msg = `⚠️ GALAT FILE FORMAT!\n\n` +
-                      `Aapne "${expected}" button click kiya hai,\n` +
-                      `Lekin file dikh rahi hai: "${actual}"\n\n` +
-                      `Iska matlab aap stock ${uploadType === 'In' ? 'ADD' : 'REDUCE'} karne wale ho ` +
-                      `${detectedFormat === 'sale' ? 'sale data se' : 'purchase data se'} — ye galat hai!\n\n` +
-                      `Sahi tarika:\n` +
-                      `• Purchase Voucher button → purchase voucher file\n` +
-                      `• Purchase Challan button → purchase challan file\n` +
-                      `• Upload Sale button → sale report file\n\n` +
-                      `Cancel karke sahi button use karo. Continue karna hai (RISKY)?`;
-          if (!confirm(msg)) {
-            return; // Stop the upload completely
-          }
+          alert(`❌ GALAT FILE!\n\n` +
+                `Aapne "${expected}" button click kiya hai,\n` +
+                `Lekin file hai: "${actual}"\n\n` +
+                `Ye file accept NAHI hogi.\n\n` +
+                `Sahi tarika:\n` +
+                `• Purchase Voucher button → sirf purchase voucher file\n` +
+                `• Purchase Challan button → sirf purchase challan file\n` +
+                `• Upload Sale button → sirf sale report file\n\n` +
+                `Sahi button click karke dobara try karo.`);
+          return; // Strict reject - no continue option
+        }
+
+        // Also reject if file format CAN'T be detected at all (random/unknown file)
+        if (!detectedFormat) {
+          const expected = formatNames[uploadFormat];
+          alert(`❌ FILE PEHCHANI NAHI GAYI!\n\n` +
+                `Ye file "${expected}" jaise nahi dikhti.\n\n` +
+                `Expected columns missing hain:\n` +
+                (uploadFormat === 'voucher' ? '• VOUCHER DATE / NET AMOUNT / RATE/UNIT / GROSS AMOUNT\n' : '') +
+                (uploadFormat === 'challan' ? '• CH DATE / CH NO. / PACK/GRADE\n' : '') +
+                (uploadFormat === 'sale' ? '• SALE QTY / AGENT NAME\n' : '') +
+                `\nSahi format ki file upload karo.`);
+          return;
         }
         // ============== END VALIDATION ==============
 
