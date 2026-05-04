@@ -1797,6 +1797,49 @@
           if (hits >= 3) { headerRowIdx = i; break; }
         }
         const headers = aoa[headerRowIdx].map(h => String(h || '').trim());
+
+        // ============== FILE TYPE VALIDATION ==============
+        // Detect if user uploaded the WRONG file type via the wrong button.
+        // Each format has unique columns that prove its type.
+        const headerSetLower = headers.map(h => h.toLowerCase().replace(/[\s_/.-]/g, ''));
+        const hasCol = (name) => headerSetLower.includes(name);
+
+        // Detect actual file type from headers
+        let detectedFormat = null;
+        if (hasCol('saleqty') || hasCol('agentname')) {
+          detectedFormat = 'sale';
+        } else if (hasCol('chdate') || hasCol('chno') || hasCol('packgrade')) {
+          detectedFormat = 'challan';
+        } else if (hasCol('voucherdate') || hasCol('netamount') || hasCol('rateunit') || hasCol('grossamount')) {
+          detectedFormat = 'voucher';
+        }
+
+        // Compare detected vs expected (uploadFormat is set when user clicked the button)
+        const formatNames = {
+          voucher: 'Purchase Voucher',
+          challan: 'Purchase Challan',
+          sale: 'Sale Report'
+        };
+
+        if (detectedFormat && detectedFormat !== uploadFormat) {
+          const expected = formatNames[uploadFormat];
+          const actual = formatNames[detectedFormat];
+          const msg = `⚠️ GALAT FILE FORMAT!\n\n` +
+                      `Aapne "${expected}" button click kiya hai,\n` +
+                      `Lekin file dikh rahi hai: "${actual}"\n\n` +
+                      `Iska matlab aap stock ${uploadType === 'In' ? 'ADD' : 'REDUCE'} karne wale ho ` +
+                      `${detectedFormat === 'sale' ? 'sale data se' : 'purchase data se'} — ye galat hai!\n\n` +
+                      `Sahi tarika:\n` +
+                      `• Purchase Voucher button → purchase voucher file\n` +
+                      `• Purchase Challan button → purchase challan file\n` +
+                      `• Upload Sale button → sale report file\n\n` +
+                      `Cancel karke sahi button use karo. Continue karna hai (RISKY)?`;
+          if (!confirm(msg)) {
+            return; // Stop the upload completely
+          }
+        }
+        // ============== END VALIDATION ==============
+
         const dataRows = aoa.slice(headerRowIdx + 1).map(arr => {
           const obj = {};
           headers.forEach((h, j) => { if (h) obj[h] = arr[j]; });
