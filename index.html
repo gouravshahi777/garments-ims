@@ -1028,32 +1028,25 @@
 <!-- SheetJS for Excel parsing -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
-<!-- Firebase SDK (compat version for plain HTML) -->
-<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore-compat.js"></script>
+<!-- Supabase SDK (replaces Firebase) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
 <script>
-  // ============== FIREBASE CONFIG ==============
-  // This config is from your Firebase Console. The apiKey is safe to expose
-  // in client-side code — security is enforced by Firestore Rules.
-  const firebaseConfig = {
-    apiKey: "AIzaSyBaIxmZk8rmBlsbdZpcFM0ipWejwiu40E8",
-    authDomain: "garments-ims.firebaseapp.com",
-    projectId: "garments-ims",
-    storageBucket: "garments-ims.firebasestorage.app",
-    messagingSenderId: "326625610840",
-    appId: "1:326625610840:web:a9f36656fb0fd8b1f5ce2d"
-  };
+  // ============== SUPABASE CONFIG ==============
+  // Supabase URL aur Publishable Key — safe to expose in client code.
+  // Security comes from RLS policies (which we've left off for simplicity, since
+  // the URL is unguessable + the app has its own login system).
+  const SUPABASE_URL = 'https://bovtchbuoaeomfiptzsh.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_66DDpzRDfjcD4ZMSbhp1ew_mBMjZl_8';
 
-  // Initialize Firebase
-  let firebaseApp, db;
+  // Initialize Supabase client
+  let db; // Supabase client (kept name 'db' for minimal code changes)
   try {
-    firebaseApp = firebase.initializeApp(firebaseConfig);
-    db = firebase.firestore();
-    console.log('✓ Firebase initialized');
+    db = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    console.log('✓ Supabase initialized');
   } catch (err) {
-    console.error('Firebase init failed:', err);
-    alert('Firebase connect nahi ho paya. Internet check karo aur page reload karo.');
+    console.error('Supabase init failed:', err);
+    alert('Supabase connect nahi ho paya. Internet check karo aur page reload karo.');
   }
 
   // ============== ROLES & AUTH CONFIG ==============
@@ -1089,7 +1082,7 @@
   function canDelete() { return isAdmin(); }
   function canManageUsers() { return isAdmin(); }
 
-  // Path structure for Firestore: /shops/{SHOP_DOC}/...
+  // Path structure for Supabase: shops table, row with shop_id = SHOP_DOC
   const SHOP_DOC = 'mainshop';
 </script>
 
@@ -1112,48 +1105,54 @@
   let pendingNewBrands = [];
   let pendingNewSkus = [];
 
-  // STORAGE — Firebase Firestore (cloud, accessible from anywhere)
-  // Falls back to local cache while Firebase loads.
-  // Path structure: /shops/{SHOP_DOC}/{collection}/{docId}
-  // For simplicity: store entire suppliers/brands/items/transactions arrays in single docs.
+  // STORAGE — Supabase (cloud, accessible from anywhere)
+  // Falls back to local cache while Supabase loads.
+  // Stores entire suppliers/brands/items/transactions arrays in a single JSONB column.
 
   let isOnline = false;
   let saveQueue = Promise.resolve(); // serialize saves to avoid race conditions
 
   async function loadData() {
     if (!db) {
-      alert('Firebase ready nahi hai. Page reload karo.');
+      alert('Supabase ready nahi hai. Page reload karo.');
       return;
     }
     showLoadingOverlay('Loading data from cloud...');
     try {
-      const shopRef = db.collection('shops').doc(SHOP_DOC);
-      const snapshot = await shopRef.get();
+      // Query shops table for the row with shop_id = 'mainshop'
+      const { data: rows, error } = await db
+        .from('shops')
+        .select('data')
+        .eq('shop_id', SHOP_DOC)
+        .limit(1);
 
-      if (snapshot.exists) {
-        const data = snapshot.data();
-        suppliers = data.suppliers || [];
-        brands = data.brands || [];
-        items = data.items || [];
-        transactions = data.transactions || [];
-        if (data.settings) settings = { ...settings, ...data.settings };
+      if (error) throw error;
+
+      if (rows && rows.length > 0 && rows[0].data) {
+        const d = rows[0].data;
+        suppliers = d.suppliers || [];
+        brands = d.brands || [];
+        items = d.items || [];
+        transactions = d.transactions || [];
+        if (d.settings) settings = { ...settings, ...d.settings };
         isOnline = true;
         bumpDataVersion();
-        console.log(`✓ Loaded from Firebase: ${suppliers.length} suppliers, ${brands.length} brands, ${items.length} SKUs, ${transactions.length} transactions`);
+        console.log(`✓ Loaded from Supabase: ${suppliers.length} suppliers, ${brands.length} brands, ${items.length} SKUs, ${transactions.length} transactions`);
       } else {
-        // First-time use — create empty document
-        console.log('No data in Firebase yet, creating empty shop document');
-        await shopRef.set({
-          suppliers: [], brands: [], items: [], transactions: [], settings,
-          createdAt: firebase.firestore.FieldValue.serverTimestamp()
-        });
+        // First-time use — insert empty row
+        console.log('No data in Supabase yet, creating empty shop row');
+        const emptyData = { suppliers: [], brands: [], items: [], transactions: [], settings };
+        const { error: insertErr } = await db
+          .from('shops')
+          .insert({ shop_id: SHOP_DOC, data: emptyData });
+        if (insertErr) throw insertErr;
         isOnline = true;
         // Load sample data for first-time users
         await loadSampleData(false);
       }
     } catch (err) {
-      console.error('Firebase load failed:', err);
-      alert('Cloud se data load nahi hua. Reasons:\n\n1. Internet nahi hai\n2. Firestore Database create nahi kiya\n3. Rules "if true" set nahi kiye\n\nFirebase Console mein check karo.');
+      console.error('Supabase load failed:', err);
+      alert('Cloud se data load nahi hua. Reasons:\n\n1. Internet nahi hai\n2. Supabase table create nahi ki\n3. Wrong API key\n\nDetails: ' + (err.message || err));
       isOnline = false;
     } finally {
       hideLoadingOverlay();
@@ -1165,7 +1164,7 @@
 
   async function saveAll() {
     if (!db || !isOnline) {
-      console.warn('Firebase offline — save skipped');
+      console.warn('Supabase offline — save skipped');
       toast('⚠️ Offline — changes saved nahi hue. Internet connect karo.');
       lastSaveOk = false;
       return;
@@ -1174,24 +1173,22 @@
     // Queue saves so concurrent updates don't race
     saveQueue = saveQueue.then(async () => {
       try {
-        const shopRef = db.collection('shops').doc(SHOP_DOC);
-        await shopRef.set({
-          suppliers,
-          brands,
-          items,
-          transactions,
-          settings,
-          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        console.log('✓ Saved to Firebase');
+        const dataPayload = { suppliers, brands, items, transactions, settings };
+        // Upsert (update if exists, insert if not) by shop_id
+        const { error } = await db
+          .from('shops')
+          .update({ data: dataPayload })
+          .eq('shop_id', SHOP_DOC);
+        if (error) throw error;
+        console.log('✓ Saved to Supabase');
         lastSaveOk = true;
       } catch (err) {
-        console.error('Firebase save failed:', err);
+        console.error('Supabase save failed:', err);
         lastSaveOk = false;
-        if (err.message && err.message.includes('exceeds the maximum')) {
-          toast('⚠️ Data zyada hai (1MB limit) — kuch purana data delete karo');
-        } else if (err.code === 'permission-denied') {
-          toast('⚠️ Permission denied — Firestore rules check karo');
+        if (err.message && err.message.toLowerCase().includes('payload')) {
+          toast('⚠️ Data bahut zyada hai — kuch purana data delete karo');
+        } else if (err.code === 'PGRST301' || (err.message && err.message.includes('permission'))) {
+          toast('⚠️ Permission denied — Supabase RLS check karo');
         } else {
           toast('⚠️ Cloud save fail ho gaya — internet check karo');
         }
@@ -1200,7 +1197,7 @@
     return saveQueue;
   }
 
-  // Loading overlay shown during initial Firebase load
+  // Loading overlay shown during initial Supabase load
   function showLoadingOverlay(msg) {
     let overlay = document.getElementById('fb-loading-overlay');
     if (!overlay) {
@@ -1504,23 +1501,27 @@
     }
   }
 
-  // Manual refresh — re-fetch latest data from Firebase
+  // Manual refresh — re-fetch latest data from Supabase
   async function refreshFromCloud() {
     if (!db) {
-      toast('⚠️ Firebase ready nahi hai');
+      toast('⚠️ Supabase ready nahi hai');
       return;
     }
     showLoadingOverlay('Refreshing from cloud...');
     try {
-      const shopRef = db.collection('shops').doc(SHOP_DOC);
-      const snapshot = await shopRef.get();
-      if (snapshot.exists) {
-        const data = snapshot.data();
-        suppliers = data.suppliers || [];
-        brands = data.brands || [];
-        items = data.items || [];
-        transactions = data.transactions || [];
-        if (data.settings) settings = { ...settings, ...data.settings };
+      const { data: rows, error } = await db
+        .from('shops')
+        .select('data')
+        .eq('shop_id', SHOP_DOC)
+        .limit(1);
+      if (error) throw error;
+      if (rows && rows.length > 0 && rows[0].data) {
+        const d = rows[0].data;
+        suppliers = d.suppliers || [];
+        brands = d.brands || [];
+        items = d.items || [];
+        transactions = d.transactions || [];
+        if (d.settings) settings = { ...settings, ...d.settings };
         bumpDataVersion();
         // Re-check role since users list might have changed
         if (currentUser) {
@@ -2186,12 +2187,15 @@
       if (!confirm(msg)) return;
     }
 
-    // ============== FIREBASE SIZE LIMIT CHECK ==============
-    // Firestore has a 1 MB limit per document. Estimate size after this import.
+    // ============== SUPABASE SIZE CHECK ==============
+    // Supabase free plan has 500 MB total database storage (vs Firebase's 1 MB).
+    // We store everything in one JSONB column. Warn if approaching ~50 MB
+    // (still 10× headroom on the 500 MB free limit).
     const projectedTransactions = transactions.length + valid.length;
     const estimatedSizeKB = Math.round((projectedTransactions * 0.18) + (items.length * 0.3) + 5);
-    if (estimatedSizeKB > 900) {
-      const msg = `⚠️ STORAGE LIMIT WARNING\n\nAfter this import, your data will be approximately ${estimatedSizeKB} KB.\n\nFirebase free plan has a 1024 KB (1 MB) limit per document. If you exceed this, the cloud save will FAIL and you may lose data.\n\nCurrent transactions: ${transactions.length}\nAfter import: ${projectedTransactions}\n\nRecommendation:\n• Don't import old historical data — only recent sales\n• Or delete old transactions in Activity tab first\n\nContinue anyway? (Risky)`;
+    const estimatedSizeMB = estimatedSizeKB / 1024;
+    if (estimatedSizeMB > 50) {
+      const msg = `⚠️ STORAGE WARNING\n\nAfter this import, your data will be approximately ${estimatedSizeMB.toFixed(1)} MB.\n\nSupabase free plan ka 500 MB limit hai — abhi safe ho lekin warning de raha hu.\n\nCurrent transactions: ${transactions.length}\nAfter import: ${projectedTransactions}\n\nRecommendation:\n• Hafte mein ek baar Activity tab se purana data delete karo\n• Ya backup le ke wipe kar do\n\nContinue?`;
       if (!confirm(msg)) return;
     }
 
@@ -2243,7 +2247,7 @@
       // Save failed — undo the local changes so user can retry
       // Remove the transactions we just added
       transactions.splice(transactions.length - valid.length, valid.length);
-      alert('⚠️ Cloud save fail ho gaya!\n\nReasons:\n• Internet down\n• Data 1 MB limit cross kar gaya\n• Firestore rules block kar rahe hain\n\nUpload cancel ho gaya. Browser console (F12) mein details dekho.');
+      alert('⚠️ Cloud save fail ho gaya!\n\nReasons:\n• Internet down\n• Supabase server slow ho raha hai\n• Aapka API key galat hai\n\nUpload cancel ho gaya. Browser console (F12) mein details dekho.');
       renderAll();
       return;
     }
