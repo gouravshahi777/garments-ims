@@ -663,7 +663,7 @@
       <span style="color: var(--text-dim); font-size:12px" id="reorder-count"></span>
     </div>
     <div style="font-size:12px; color: var(--text-dim); margin-bottom:14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; border-left: 3px solid var(--warn);">
-      <strong>Reorder List:</strong> items that are out of stock or below their reorder point. Out-of-stock items always show here (urgent). Fast-moving items with healthy stock show in the Fast Movers tab instead.
+      <strong>Reorder List:</strong> complete list of items that need ordering — out of stock, low stock, AND fast movers. This is your master order list to send to suppliers.
     </div>
     <div id="reorder-content"></div>
   </div>
@@ -3117,18 +3117,18 @@
       return { item: i, stock, status, velocity: v };
     });
 
-    // REORDER LIST: out-of-stock OR below reorder point (regardless of fast-mover status)
-    // Logic: out-of-stock is urgent action; below-ROP is normal refill.
-    // Fast mover items that are ALSO out-of-stock will appear in BOTH tabs (dono actions zaruri hain)
-    // Fast mover items that still have healthy stock will ONLY appear in Fast Movers tab.
-    const regular = all.filter(r => r.status === 'outofstock' || r.status === 'reorder' || r.status === 'low')
-                       .filter(r => {
-                         // If item is fast mover AND has positive stock (just below ROP), exclude from regular
-                         // because Fast Movers tab is the right place for it.
-                         // Out-of-stock items always go in Reorder List.
-                         if (r.velocity.triggered && r.stock > 0) return false;
-                         return true;
-                       });
+    // REORDER LIST: includes EVERYTHING that needs ordering
+    // - Out of stock items
+    // - Below reorder point items
+    // - Fast movers (even with stock — kyunki order karna chahiye supplier ko)
+    // Fast movers will appear in BOTH Reorder List AND Fast Movers tab
+    // (user requested: "dono jagah dikhe")
+    const regular = all.filter(r =>
+      r.status === 'outofstock' ||
+      r.status === 'reorder' ||
+      r.status === 'low' ||
+      r.velocity.triggered
+    );
 
     // FAST MOVERS: velocity triggered (regardless of stock level)
     const fastMovers = all.filter(r => r.velocity.triggered);
