@@ -496,8 +496,9 @@
       <button class="btn btn-ghost" onclick="refreshFromCloud()" title="Cloud se latest data laao">🔄 Refresh</button>
       <button class="btn btn-ghost role-edit" onclick="openSupplierModal()">+ Supplier</button>
       <button class="btn btn-ghost role-edit" onclick="openBrandModal()">+ Brand</button>
-      <button class="btn btn-good role-edit" onclick="openUploadModal('In')">📥 Upload Purchase</button>
-      <button class="btn btn-danger role-edit" onclick="openUploadModal('Out')">📤 Upload Sale</button>
+      <button class="btn btn-good role-edit" onclick="openUploadModal('In', 'voucher')">📥 Purchase Voucher</button>
+      <button class="btn btn-good role-edit" onclick="openUploadModal('In', 'challan')" style="background: #5cbb39;">📥 Purchase Challan</button>
+      <button class="btn btn-danger role-edit" onclick="openUploadModal('Out', 'sale')">📤 Upload Sale</button>
       <button class="btn role-edit" onclick="openItemModal()">+ Add SKU</button>
     </div>
   </div>
@@ -1099,7 +1100,8 @@
   let currentBrandFocus = null;
 
   // Upload state
-  let uploadType = 'In';
+  let uploadType = 'In';      // 'In' | 'Out'
+  let uploadFormat = 'voucher'; // 'voucher' | 'challan' | 'sale'
   let parsedRows = [];
   let pendingNewSuppliers = [];
   let pendingNewBrands = [];
@@ -1699,17 +1701,28 @@
   }
 
   // ============== EXCEL UPLOAD ==============
-  function openUploadModal(type) {
+  function openUploadModal(type, format) {
     uploadType = type;
+    uploadFormat = format || (type === 'In' ? 'voucher' : 'sale');
     parsedRows = [];
     pendingNewSuppliers = [];
     pendingNewBrands = [];
     pendingNewSkus = [];
-    document.getElementById('upload-modal-title').textContent =
-      type === 'In' ? '📥 Upload Purchase Sheet (Stock IN)' : '📤 Upload Sale Sheet (Stock OUT)';
-    document.getElementById('upload-modal-sub').innerHTML = type === 'In'
-      ? `Each row will be added as <strong>Stock IN</strong>. New suppliers, brands, and SKUs will be auto-created from the file. <strong>SKU code = Lot Number + Size</strong> (Lot Code is ignored). Recognized columns: Party Name, Company Name, Item Name, Shade, Pack/Size, Lot Number, Quantity, Date, Rate.`
-      : `Each row will be added as <strong>Stock OUT</strong>. SKU must already exist (uploaded via a purchase sheet first). Recognized columns: SKU Code or Lot Number+Size, Quantity, Date.`;
+
+    let title, sub;
+    if (uploadFormat === 'voucher') {
+      title = '📥 Upload Purchase Voucher (Stock IN)';
+      sub = `Each row will be added as <strong>Stock IN</strong>. New suppliers, brands, and SKUs will be auto-created. <strong>SKU code = Lot Number + Size</strong>.<br>Expected columns: <code>Party Name, Company Name, Item Name, Shade, Pack/Size, <strong>Lot Number</strong>, Total Quantity, Voucher Date, Rate</code>.`;
+    } else if (uploadFormat === 'challan') {
+      title = '📥 Upload Purchase Challan (Stock IN)';
+      sub = `Each row will be added as <strong>Stock IN</strong>. New suppliers and SKUs will be auto-created. <strong>SKU code = Lot No. + Pack/Grade</strong>.<br>Expected columns: <code>Ch Date, Ch No., Party Name, Item Name, Pack/Grade, <strong>Lot No.</strong>, Total Qty</code>.`;
+    } else {
+      title = '📤 Upload Sale Report (Stock OUT)';
+      sub = `Each row will be added as <strong>Stock OUT</strong>. SKU must already exist (uploaded via Purchase Voucher or Challan first).<br>Expected columns: <code>Bill Date, Company Name, Category, Pack/Size, Item Name, Sale Qty, Shade, <strong>Lot Number</strong></code>.`;
+    }
+
+    document.getElementById('upload-modal-title').textContent = title;
+    document.getElementById('upload-modal-sub').innerHTML = sub;
     document.getElementById('upload-step-1').style.display = 'block';
     document.getElementById('upload-step-2').style.display = 'none';
     document.getElementById('file-input').value = '';
@@ -1817,21 +1830,34 @@
       // Direct SKU code (if file has one) — preferred
       let skuCode = String(norm.skucode || norm.sku || norm.code || norm.itemcode || '').trim();
 
-      // Fields from billing software exports
-      const partyName = String(norm.partyname || norm.party || norm.supplier || norm.suppliername || '').trim();
+      // Fields from billing software exports — column names matched flexibly.
+      // Supports all 3 formats: Purchase Voucher, Purchase Challan, Sale Report.
+      const partyName = String(norm.partyname || norm.party || norm.supplier || norm.suppliername || norm.agentname || '').trim();
       const companyName = String(norm.companyname || norm.company || norm.brand || norm.brandname || '').trim();
       const groupName = String(norm.groupname || norm.group || norm.category || '').trim();
       const itemName = String(norm.itemname || norm.item || norm.product || norm.productname || '').trim();
       const shade = String(norm.shadename || norm.shade || norm.colour || norm.color || '').trim();
-      const size = String(norm.packsize || norm.pack || norm.size || '').trim();
-      // Lot Number is what we use to build the SKU. Lot Code is ignored as requested.
-      const lotNumber = String(norm.lotnumber || norm.lotno || '').trim();
-      const rate = parseFloat(String(norm.rateunit || norm.rate || norm.cost || norm.price || '').replace(/,/g, '')) || 0;
+      // Pack/Size: Voucher uses "Pack/Size", Challan uses "Pack/Grade"
+      const size = String(norm.packsize || norm.packgrade || norm.pack || norm.size || norm.grade || '').trim();
+      // Lot identifier: Voucher "Lot Number", Challan "Lot No.", both → lotnumber/lotno after normalization
+      const lotNumber = String(norm.lotnumber || norm.lotno || norm.lot || '').trim();
+      const rate = parseFloat(String(norm.rateunit || norm.rate || norm.cost || norm.price || norm.netamount || norm.grossamount || '').replace(/,/g, '')) || 0;
 
-      const qtyRaw = norm.totalquantity ?? norm.quantity ?? norm.qty ?? norm.units ?? norm.pieces ?? norm.pcs ?? '';
+      // Quantity: Voucher "Total Quantity", Challan "Total Qty", Sale "Sale Qty"
+      const qtyRaw = norm.totalquantity ?? norm.totalqty ?? norm.saleqty ?? norm.quantity ?? norm.qty ?? norm.units ?? norm.pieces ?? norm.pcs ?? '';
       const qty = parseFloat(String(qtyRaw).replace(/,/g, ''));
-      const date = norm.voucherdate || norm.date || norm.billdate || '';
-      const note = String(norm.note || norm.remarks || norm.billno || norm.invoice || norm.customer || '').trim();
+
+      // DEBUG: print first 3 rows so user can see what the parser found
+      if (idx < 3) {
+        console.log(`[DEBUG Row ${idx + headerRowIdx + 2}] All normalized keys:`, Object.keys(norm));
+        console.log(`[DEBUG Row ${idx + headerRowIdx + 2}] qtyRaw="${qtyRaw}", parsed qty=${qty}, lotNumber="${lotNumber}", size="${size}"`);
+      }
+
+      // Date: Voucher "Voucher Date", Challan "Ch Date", Sale "Bill Date"
+      const date = norm.voucherdate || norm.chdate || norm.billdate || norm.date || '';
+
+      // Note/Reference: Voucher "Bill No.", Challan "Ch No."
+      const note = String(norm.note || norm.remarks || norm.billno || norm.chno || norm.invoice || norm.customer || '').trim();
 
       // SKU code priority:
       // 1) Direct SKU Code column if present
