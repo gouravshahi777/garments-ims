@@ -444,22 +444,37 @@
 
 <!-- ============== LOGIN SCREEN ============== -->
 <div id="login-screen" style="position:fixed; inset:0; background: linear-gradient(135deg, #0e1116 0%, #1c232c 100%); z-index: 9999; display: none; align-items: center; justify-content: center; padding: 20px; font-family: 'Geist', sans-serif;">
-  <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 40px 32px; max-width: 420px; width: 100%; text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
-    <div style="width: 70px; height: 70px; background: var(--accent); border-radius: 14px; margin: 0 auto 22px; display: grid; place-items: center; font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: #0e1116; font-size: 32px;">RG</div>
-    <h1 style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.02em;">Retail Garments IMS</h1>
-    <p style="color: var(--text-dim); font-size: 13px; margin: 0 0 30px;">Apne Google account se sign in karo</p>
+  <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 40px 32px; max-width: 420px; width: 100%; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+    <div style="text-align:center;">
+      <div style="width: 70px; height: 70px; background: var(--accent); border-radius: 14px; margin: 0 auto 22px; display: grid; place-items: center; font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: #0e1116; font-size: 32px;">RG</div>
+      <h1 style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.02em;">Retail Garments IMS</h1>
+      <p style="color: var(--text-dim); font-size: 13px; margin: 0 0 28px;">Username aur password se sign in karo</p>
+    </div>
 
-    <button id="login-btn" onclick="signInWithGoogle()" style="width: 100%; background: white; color: #1f1f1f; border: none; padding: 12px 20px; border-radius: 10px; font-weight: 600; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 12px; font-family: inherit; transition: all 0.15s;">
-      <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"/><path fill="#FF3D00" d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"/><path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238A11.91 11.91 0 0 1 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"/><path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303a12.04 12.04 0 0 1-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"/></svg>
-      Sign in with Google
+    <div class="field" style="margin-bottom: 14px;">
+      <label>Username</label>
+      <input type="text" id="login-username" placeholder="admin" autocomplete="username" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 11px 13px; border-radius: 8px; font-size: 14px; font-family: inherit; outline: none;" />
+    </div>
+
+    <div class="field" style="margin-bottom: 18px;">
+      <label>Password</label>
+      <input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 11px 13px; border-radius: 8px; font-size: 14px; font-family: inherit; outline: none;" onkeydown="if(event.key==='Enter') signInWithUsername()" />
+    </div>
+
+    <button id="login-btn" onclick="signInWithUsername()" style="width: 100%; background: var(--accent); color: #0e1116; border: none; padding: 12px 20px; border-radius: 10px; font-weight: 700; font-size: 14px; cursor: pointer; font-family: inherit; transition: all 0.15s;">
+      Sign In
     </button>
 
-    <div id="login-error" style="display:none; margin-top: 18px; padding: 12px; background: rgba(248,81,73,0.1); border: 1px solid var(--bad); border-radius: 8px; color: var(--bad); font-size: 12px; text-align: left;"></div>
+    <div id="login-error" style="display:none; margin-top: 16px; padding: 10px 12px; background: rgba(248,81,73,0.1); border: 1px solid var(--bad); border-radius: 8px; color: var(--bad); font-size: 12px;"></div>
 
-    <p style="color: var(--text-dim); font-size: 11px; margin: 24px 0 0; line-height: 1.5;">
-      Sirf authorized users hi access kar sakte hain.<br>
-      Agar aapka access nahi hai, owner se contact karo.
-    </p>
+    <div style="margin-top: 24px; padding: 12px; background: var(--bg); border-radius: 8px; font-size: 11px; color: var(--text-dim); line-height: 1.6;">
+      <strong style="color: var(--text);">First-time login (default):</strong><br>
+      👑 <code style="color: var(--accent);">admin</code> / <code>admin123</code> — full access<br>
+      📊 <code style="color: var(--info);">manager</code> / <code>manager123</code> — upload + edit<br>
+      👁️ <code style="color: var(--text-dim);">staff1</code> / <code>staff123</code> — read-only<br>
+      <br>
+      ⚠️ <strong>Login ke baad turant Settings mein passwords change karo!</strong>
+    </div>
   </div>
 </div>
 
@@ -767,7 +782,7 @@
     </div>
 
     <div class="setting-card" id="manage-users-section" style="border-left: 3px solid var(--accent);">
-      <h3>👥 Manage User Access (Admin Only)</h3>
+      <h3>👥 Manage Users (Admin Only)</h3>
       <p>
         Logon ko 3 roles mein add kar sakte ho:<br>
         <strong>👑 Admin</strong> — full access (sab kuch kar sakte hain)<br>
@@ -780,23 +795,33 @@
         <div id="users-list" style="display: flex; flex-direction: column; gap: 6px;"></div>
       </div>
 
-      <div style="display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; align-items: flex-end;">
-        <div class="field" style="flex: 1; min-width: 200px;">
-          <label>Email Address</label>
-          <input type="email" id="new-user-email" placeholder="staff@gmail.com" style="width: 100%;" />
+      <div style="margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--border);">
+        <div style="font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; margin-bottom: 10px;">Add New User:</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr 130px auto; gap: 8px; align-items: flex-end;">
+          <div class="field">
+            <label>Username</label>
+            <input type="text" id="new-user-email" placeholder="staff3" style="width: 100%;" />
+          </div>
+          <div class="field">
+            <label>Password</label>
+            <input type="text" id="new-user-password" placeholder="atleast 4 chars" style="width: 100%;" />
+          </div>
+          <div class="field">
+            <label>Role</label>
+            <select id="new-user-role" class="select" style="width: 100%;">
+              <option value="manager">Manager</option>
+              <option value="staff" selected>Staff</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+          <button class="btn" onclick="addUserAccess()">Add</button>
         </div>
-        <div class="field" style="min-width: 130px;">
-          <label>Role</label>
-          <select id="new-user-role" class="select" style="width: 100%;">
-            <option value="manager">Manager</option>
-            <option value="staff" selected>Staff (read-only)</option>
-            <option value="admin">Admin</option>
-          </select>
-        </div>
-        <button class="btn" onclick="addUserAccess()">Add User</button>
       </div>
-      <p style="font-size: 11px; color: var(--text-dim); margin-top: 10px;">
-        💡 User ko Gmail account hona chahiye. Add karne ke baad usse aapka site URL bhejo — wo Google se sign in karke access kar sakega.
+
+      <p style="font-size: 11px; color: var(--text-dim); margin-top: 14px; line-height: 1.5;">
+        💡 <strong>Tip:</strong> Username mein sirf lowercase, numbers aur underscore (_) chal sakte hain. Spaces ya special chars nahi.<br>
+        🔑 Password change karne ke liye user ke saamne wala 🔑 button click karo.<br>
+        ⚠️ <strong>Default passwords abhi simple hain (admin123 etc.) — pehle inhe change karo!</strong>
       </p>
     </div>
 
@@ -1000,7 +1025,6 @@
 <!-- Firebase SDK (compat version for plain HTML) -->
 <script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-auth-compat.js"></script>
 
 <script>
   // ============== FIREBASE CONFIG ==============
@@ -1016,11 +1040,10 @@
   };
 
   // Initialize Firebase
-  let firebaseApp, db, auth;
+  let firebaseApp, db;
   try {
     firebaseApp = firebase.initializeApp(firebaseConfig);
     db = firebase.firestore();
-    auth = firebase.auth();
     console.log('✓ Firebase initialized');
   } catch (err) {
     console.error('Firebase init failed:', err);
@@ -1028,27 +1051,29 @@
   }
 
   // ============== ROLES & AUTH CONFIG ==============
-  // Owner email — hardcoded, always Admin. Cannot be removed.
-  const OWNER_EMAIL = 'gouravshahi777@gmail.com';
+  // Default users — first-time setup. After login, Admin can change passwords / add users in Settings.
+  const DEFAULT_USERS = {
+    'admin':    { password: 'admin123',    role: 'admin',   isOwner: true },
+    'manager':  { password: 'manager123',  role: 'manager', isOwner: false },
+    'staff1':   { password: 'staff123',    role: 'staff',   isOwner: false },
+    'staff2':   { password: 'staff456',    role: 'staff',   isOwner: false }
+  };
 
   // Roles:
-  //   admin   — full access (only owner by default; can promote others)
+  //   admin   — full access. The 'admin' user is owner and cannot be deleted.
   //   manager — can upload/add/edit, but NOT delete or change settings
-  //   staff   — read-only (no buttons, just view)
-  // Authorized users list is stored in Firestore under settings.users
-  // Default: { 'gouravshahi777@gmail.com': 'admin' }
+  //   staff   — read-only
 
-  // Current user state
-  let currentUser = null;        // Firebase user object after login
-  let currentUserEmail = null;   // lowercase email
+  // Current session state
+  let currentUser = null;        // username after login
   let currentUserRole = null;    // 'admin' | 'manager' | 'staff' | null
 
-  function getUserRole(email) {
-    if (!email) return null;
-    const lower = email.toLowerCase();
-    if (lower === OWNER_EMAIL.toLowerCase()) return 'admin';
-    const users = (settings && settings.users) || {};
-    return users[lower] || null;
+  function getUsersTable() {
+    // settings.users is the source of truth; if missing, fall back to defaults.
+    if (!settings.users || Object.keys(settings.users).length === 0) {
+      settings.users = JSON.parse(JSON.stringify(DEFAULT_USERS));
+    }
+    return settings.users;
   }
 
   function isAdmin() { return currentUserRole === 'admin'; }
@@ -1178,13 +1203,9 @@
   function renderUsersList() {
     const container = document.getElementById('users-list');
     if (!container) return;
-    if (!settings.users) settings.users = {};
+    const users = getUsersTable();
+    const entries = Object.entries(users);
 
-    // Ensure owner is always Admin in the list
-    const ownerLower = OWNER_EMAIL.toLowerCase();
-    const allUsers = { [ownerLower]: 'admin', ...settings.users };
-
-    const entries = Object.entries(allUsers);
     if (entries.length === 0) {
       container.innerHTML = '<div style="color: var(--text-dim); font-size: 12px;">No users yet.</div>';
       return;
@@ -1196,22 +1217,31 @@
       staff:   { bg: 'rgba(139,148,158,0.15)',  color: 'var(--text-dim)' }
     };
 
-    container.innerHTML = entries.map(([email, role]) => {
+    container.innerHTML = entries.map(([username, info]) => {
+      const role = info.role;
+      const isOwner = info.isOwner === true;
+      const isYou = username === currentUser;
       const c = roleColors[role] || roleColors.staff;
-      const isOwner = email === ownerLower;
-      const isYou = email === currentUserEmail;
       return `
-        <div style="display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--panel-2); border-radius: 6px; font-size: 12px;">
-          <span style="flex: 1; font-family: 'Geist Mono', monospace;">
-            ${escapeHtml(email)}
-            ${isOwner ? '<span style="color: var(--text-dim); font-style: italic; margin-left: 6px;">(owner)</span>' : ''}
-            ${isYou && !isOwner ? '<span style="color: var(--text-dim); font-style: italic; margin-left: 6px;">(you)</span>' : ''}
-          </span>
-          <span style="padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; background: ${c.bg}; color: ${c.color};">${role}</span>
-          ${isOwner ? '' : `<button class="btn btn-danger btn-sm" onclick="removeUserAccess('${email}')" title="Remove access">×</button>`}
+        <div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 6px; font-size: 12px;">
+          <div style="flex: 1;">
+            <div style="font-family: 'Geist Mono', monospace; font-weight: 600; font-size: 13px;">
+              ${escapeHtml(username)}
+              ${isOwner ? '<span style="color: var(--text-dim); font-style: italic; margin-left: 6px; font-weight: normal;">(owner)</span>' : ''}
+              ${isYou && !isOwner ? '<span style="color: var(--text-dim); font-style: italic; margin-left: 6px; font-weight: normal;">(you)</span>' : ''}
+            </div>
+            <div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">Password: <span style="font-family: 'Geist Mono', monospace;">${'•'.repeat(Math.min(info.password.length, 12))}</span></div>
+          </div>
+          <span style="padding: 3px 9px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; background: ${c.bg}; color: ${c.color};">${role}</span>
+          <button class="btn btn-ghost btn-sm" onclick="changeUserPassword('${escapeJs(username)}')" title="Change password">🔑</button>
+          ${isOwner ? '' : `<button class="btn btn-danger btn-sm" onclick="removeUserAccess('${escapeJs(username)}')" title="Remove user">×</button>`}
         </div>
       `;
     }).join('');
+  }
+
+  function escapeJs(s) {
+    return String(s).replace(/['"\\]/g, '\\$&');
   }
 
   async function addUserAccess() {
@@ -1219,55 +1249,83 @@
       alert('Sirf Admin user add kar sakte hain.');
       return;
     }
-    const emailInput = document.getElementById('new-user-email');
+    const usernameInput = document.getElementById('new-user-email');
+    const passwordInput = document.getElementById('new-user-password');
     const roleSelect = document.getElementById('new-user-role');
-    const email = emailInput.value.trim().toLowerCase();
+    const username = (usernameInput.value || '').trim().toLowerCase();
+    const password = (passwordInput ? passwordInput.value : '') || '';
     const role = roleSelect.value;
 
-    if (!email) {
-      alert('Email daalo');
+    if (!username) {
+      alert('Username daalo');
       return;
     }
-    if (!email.includes('@') || !email.includes('.')) {
-      alert('Sahi email format daalo (jaise: name@gmail.com)');
+    if (!/^[a-z0-9_]+$/.test(username)) {
+      alert('Username mein sirf lowercase letters, numbers, aur _ chal sakte hain (no spaces, no special chars)');
       return;
     }
-    if (email === OWNER_EMAIL.toLowerCase()) {
-      alert('Owner already Admin hai — change nahi kar sakte.');
+    if (!password || password.length < 4) {
+      alert('Password kam se kam 4 characters ka hona chahiye');
       return;
     }
 
-    if (!settings.users) settings.users = {};
-    const existing = settings.users[email];
-    if (existing) {
-      if (!confirm(`${email} pehle se ${existing} hai. Role ko ${role} mein change karna hai?`)) return;
+    const users = getUsersTable();
+    if (users[username]) {
+      if (!confirm(`Username "${username}" pehle se hai. Password aur role update karna hai?`)) return;
     }
 
-    settings.users[email] = role;
+    users[username] = { password, role, isOwner: false };
     await saveAll();
     renderUsersList();
-    emailInput.value = '';
-    toast(`✓ ${email} ko ${role} access mil gaya`);
+    usernameInput.value = '';
+    if (passwordInput) passwordInput.value = '';
+    toast(`✓ ${username} (${role}) add ho gaya`);
   }
 
-  async function removeUserAccess(email) {
+  async function removeUserAccess(username) {
     if (!canManageUsers()) {
       alert('Sirf Admin remove kar sakte hain.');
       return;
     }
-    if (email === OWNER_EMAIL.toLowerCase()) {
+    const users = getUsersTable();
+    const info = users[username];
+    if (!info) return;
+    if (info.isOwner) {
       alert('Owner ko remove nahi kar sakte.');
       return;
     }
-    if (!confirm(`${email} ka access remove karna hai? Ye user ab login nahi kar payega.`)) return;
-    if (!settings.users) settings.users = {};
-    delete settings.users[email];
+    if (username === currentUser) {
+      alert('Apne aap ko remove nahi kar sakte. Pehle kisi aur Admin se karwao.');
+      return;
+    }
+    if (!confirm(`${username} ka access remove karna hai? Ye user ab login nahi kar payega.`)) return;
+    delete users[username];
     await saveAll();
     renderUsersList();
-    toast(`✓ ${email} ka access remove ho gaya`);
+    toast(`✓ ${username} remove ho gaya`);
   }
 
-  // ============== AUTHENTICATION ==============
+  async function changeUserPassword(username) {
+    if (!canManageUsers() && username !== currentUser) {
+      alert('Sirf Admin doosron ka password change kar sakte hain.');
+      return;
+    }
+    const users = getUsersTable();
+    const info = users[username];
+    if (!info) return;
+    const newPwd = prompt(`${username} ka naya password daalo:`, '');
+    if (newPwd === null) return;
+    if (!newPwd || newPwd.length < 4) {
+      alert('Password kam se kam 4 characters ka hona chahiye');
+      return;
+    }
+    info.password = newPwd;
+    await saveAll();
+    renderUsersList();
+    toast(`✓ ${username} ka password change ho gaya`);
+  }
+
+  // ============== AUTHENTICATION (Username + Password) ==============
   function showLoginScreen(errorMsg) {
     document.getElementById('login-screen').style.display = 'flex';
     document.querySelector('.app').style.display = 'none';
@@ -1278,6 +1336,11 @@
     } else {
       errEl.style.display = 'none';
     }
+    // Focus username field
+    setTimeout(() => {
+      const u = document.getElementById('login-username');
+      if (u) u.focus();
+    }, 100);
   }
 
   function hideLoginScreen() {
@@ -1285,87 +1348,114 @@
     document.querySelector('.app').style.display = '';
   }
 
-  async function signInWithGoogle() {
+  async function signInWithUsername() {
+    const usernameInput = document.getElementById('login-username');
+    const passwordInput = document.getElementById('login-password');
     const btn = document.getElementById('login-btn');
+    const errEl = document.getElementById('login-error');
+
+    const username = (usernameInput.value || '').trim().toLowerCase();
+    const password = passwordInput.value || '';
+
+    if (!username || !password) {
+      errEl.style.display = 'block';
+      errEl.textContent = 'Username aur password dono daalo';
+      return;
+    }
+
     btn.disabled = true;
     btn.style.opacity = '0.6';
     btn.textContent = 'Signing in...';
+
     try {
-      const provider = new firebase.auth.GoogleAuthProvider();
-      const result = await auth.signInWithPopup(provider);
-      console.log('✓ Signed in:', result.user.email);
-      // onAuthStateChanged listener will handle the rest
+      // Load data first to get the latest users table
+      await loadData();
+
+      const users = getUsersTable();
+      const userInfo = users[username];
+
+      if (!userInfo) {
+        throw new Error('Username galat hai');
+      }
+      if (userInfo.password !== password) {
+        throw new Error('Password galat hai');
+      }
+
+      // Login successful
+      currentUser = username;
+      currentUserRole = userInfo.role;
+
+      // Save session in browser so refresh doesn't kick out
+      try {
+        sessionStorage.setItem('rg_session_user', username);
+      } catch {}
+
+      hideLoginScreen();
+      updateUserUI();
+      applyRolePermissions();
+      renderAll();
+      passwordInput.value = '';
+      toast(`✓ Welcome, ${username}!`);
     } catch (err) {
       console.error('Sign-in failed:', err);
+      errEl.style.display = 'block';
+      errEl.textContent = err.message || 'Login failed';
       btn.disabled = false;
       btn.style.opacity = '1';
-      btn.innerHTML = `
-        <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"/><path fill="#FF3D00" d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"/><path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238A11.91 11.91 0 0 1 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"/><path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303a12.04 12.04 0 0 1-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"/></svg>
-        Sign in with Google
-      `;
-      showLoginScreen('Sign-in mein error: ' + (err.message || 'Try again'));
+      btn.textContent = 'Sign In';
     }
   }
 
-  async function signOut() {
+  function signOut() {
     if (!confirm('Logout karna hai?')) return;
-    try {
-      await auth.signOut();
-      currentUser = null;
-      currentUserEmail = null;
-      currentUserRole = null;
-      // Reload page to fully reset
-      location.reload();
-    } catch (err) {
-      console.error('Sign-out failed:', err);
-      alert('Logout failed: ' + err.message);
-    }
+    currentUser = null;
+    currentUserRole = null;
+    try { sessionStorage.removeItem('rg_session_user'); } catch {}
+    location.reload();
   }
 
-  // Listen for auth state changes (login/logout)
-  function setupAuthListener() {
-    auth.onAuthStateChanged(async (user) => {
-      if (user) {
-        currentUser = user;
-        currentUserEmail = (user.email || '').toLowerCase();
+  // Boot: check if there's a saved session, otherwise show login
+  async function setupAuthListener() {
+    let savedUser = null;
+    try { savedUser = sessionStorage.getItem('rg_session_user'); } catch {}
 
-        // Load data first to know who the authorized users are
-        await loadData();
+    if (!savedUser) {
+      showLoginScreen();
+      return;
+    }
 
-        // After data is loaded, check the role
-        currentUserRole = getUserRole(currentUserEmail);
-
-        if (!currentUserRole) {
-          // User logged in but not authorized
-          await auth.signOut();
-          showLoginScreen(`${user.email} ka access nahi hai. Owner se contact karo.`);
-          return;
-        }
-
-        // User is authorized — show the app
-        hideLoginScreen();
-        updateUserUI();
-        applyRolePermissions();
-        renderAll();
-      } else {
-        currentUser = null;
-        currentUserEmail = null;
-        currentUserRole = null;
-        showLoginScreen();
+    // Auto-login from session
+    showLoadingOverlay('Restoring session...');
+    try {
+      await loadData();
+      const users = getUsersTable();
+      const userInfo = users[savedUser];
+      if (!userInfo) {
+        // User was removed from system
+        try { sessionStorage.removeItem('rg_session_user'); } catch {}
+        hideLoadingOverlay();
+        showLoginScreen('Aapka access remove ho gaya. Dobara login karo.');
+        return;
       }
-    });
+      currentUser = savedUser;
+      currentUserRole = userInfo.role;
+      hideLoadingOverlay();
+      hideLoginScreen();
+      updateUserUI();
+      applyRolePermissions();
+      renderAll();
+    } catch (err) {
+      hideLoadingOverlay();
+      console.error('Session restore failed:', err);
+      showLoginScreen('Connection error. Dobara login karo.');
+    }
   }
 
   function updateUserUI() {
     const emailEl = document.getElementById('user-email');
     const badgeEl = document.getElementById('user-role-badge');
-    if (emailEl && currentUserEmail) {
-      // Show shortened email on small screens
-      const shortEmail = currentUserEmail.length > 22
-        ? currentUserEmail.substring(0, 19) + '...'
-        : currentUserEmail;
-      emailEl.textContent = shortEmail;
-      emailEl.title = currentUserEmail;
+    if (emailEl && currentUser) {
+      emailEl.textContent = currentUser;
     }
     if (badgeEl && currentUserRole) {
       badgeEl.textContent = currentUserRole;
@@ -1380,17 +1470,13 @@
     }
   }
 
-  // Apply UI restrictions based on role
   function applyRolePermissions() {
     const editAllowed = canEdit();
-    const deleteAllowed = canDelete();
 
-    // Hide buttons that require edit permission (for staff)
     document.querySelectorAll('.role-edit').forEach(el => {
       el.style.display = editAllowed ? '' : 'none';
     });
 
-    // For staff: also disable inline buttons by adding a CSS class
     if (!editAllowed) {
       document.body.classList.add('readonly-mode');
     } else {
@@ -1416,10 +1502,16 @@
         transactions = data.transactions || [];
         if (data.settings) settings = { ...settings, ...data.settings };
         // Re-check role since users list might have changed
-        currentUserRole = getUserRole(currentUserEmail);
-        if (!currentUserRole) {
-          await auth.signOut();
-          return;
+        if (currentUser) {
+          const users = getUsersTable();
+          const userInfo = users[currentUser];
+          if (!userInfo) {
+            // Current user was removed
+            try { sessionStorage.removeItem('rg_session_user'); } catch {}
+            location.reload();
+            return;
+          }
+          currentUserRole = userInfo.role;
         }
         applyRolePermissions();
         renderAll();
