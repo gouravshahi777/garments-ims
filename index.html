@@ -2332,7 +2332,8 @@
     // Build rows
     const headers = [
       'Supplier', 'Supplier Phone', 'Brand', 'SKU Code', 'Item', 'Size', 'Color',
-      'Current Stock', 'Order Qty', 'MOQ', 'Max Level', 'Lead Time (days)', 'Reason'
+      'Total Received', 'Total Sold', 'Sold %', 'Current Stock',
+      'Order Qty', 'MOQ', 'Max Level', 'Lead Time (days)', 'Reason'
     ];
 
     const rows = list.map(r => {
@@ -2340,6 +2341,17 @@
       const b = getBrand(i.brandId);
       const sup = getItemSupplier(i);
       const orderQty = Math.ceil(getReorderQty(i, r.stock));
+
+      // Calculate total received (purchases) and total sold (sales) for this item
+      let totalReceived = 0;
+      let totalSold = 0;
+      transactions.forEach(t => {
+        if (t.itemId !== i.id) return;
+        if (t.type === 'In') totalReceived += Number(t.qty);
+        else if (t.type === 'Out') totalSold += Number(t.qty);
+      });
+      const soldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
+
       return [
         sup?.name || '',
         sup?.phone || '',
@@ -2348,6 +2360,9 @@
         i.name,
         i.size || '',
         i.color || '',
+        totalReceived,
+        totalSold,
+        soldPct + '%',
         Math.round(r.stock),
         orderQty,
         Number(i.moq || 0),
@@ -2362,7 +2377,9 @@
     // Column widths
     ws['!cols'] = [
       { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 22 },
-      { wch: 8 },  { wch: 12 }, { wch: 11 }, { wch: 11 }, { wch: 8 },
+      { wch: 8 },  { wch: 12 },
+      { wch: 14 }, { wch: 12 }, { wch: 9 },  // Total Received, Total Sold, Sold %
+      { wch: 13 }, { wch: 11 }, { wch: 8 },
       { wch: 11 }, { wch: 14 }, { wch: 36 }
     ];
 
@@ -3075,6 +3092,23 @@
     const latest = v.batches[v.batches.length - 1];
     const reason = getReorderReason(i, r.stock);
     const accentColor = kind === 'fastmover' ? 'var(--accent)' : 'var(--warn)';
+
+    // Calculate total received and total sold for this item (lifetime)
+    let totalReceived = 0;
+    let totalSold = 0;
+    transactions.forEach(t => {
+      if (t.itemId !== i.id) return;
+      if (t.type === 'In') totalReceived += Number(t.qty);
+      else if (t.type === 'Out') totalSold += Number(t.qty);
+    });
+    const soldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
+    // Color code the sold % to give visual feedback
+    let soldPctColor = 'var(--good)';
+    if (soldPct >= 90) soldPctColor = 'var(--bad)';        // urgent — almost gone
+    else if (soldPct >= 75) soldPctColor = 'var(--warn)';  // moving fast
+    else if (soldPct >= 50) soldPctColor = '#f0c83e';      // moderate
+    // else green (selling slow)
+
     return `
       <div class="reorder-card ${r.status}" ${kind === 'fastmover' ? 'style="border-left-color: var(--accent);"' : ''}>
         <div class="reorder-card-head">
@@ -3094,6 +3128,8 @@
         </div>
         <div class="reorder-card-stats">
           <div class="stat-block"><div class="stat-label">Current Stock</div><div class="stat-value">${fmt(r.stock, 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">Total Received</div><div class="stat-value">${fmt(totalReceived, 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">Total Sold</div><div class="stat-value" style="color:${soldPctColor};">${fmt(totalSold, 0)} <span style="font-size:11px; opacity:0.8;">(${soldPct}%)</span></div></div>
           <div class="stat-block"><div class="stat-label">Max Level</div><div class="stat-value">${fmt(i.max, 0)}</div></div>
           <div class="stat-block"><div class="stat-label">MOQ</div><div class="stat-value">${fmt(i.moq, 0)}</div></div>
           <div class="stat-block"><div class="stat-label">Lead Time</div><div class="stat-value">${getBrandLT(i) > 0 ? getBrandLT(i)+'d' : '—'}</div></div>
