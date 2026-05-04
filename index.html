@@ -64,7 +64,7 @@
   .tab.active { background: var(--accent); color: #0e1116; font-weight: 600; }
 
   .kpi-row {
-    display: grid; grid-template-columns: repeat(4, 1fr);
+    display: grid; grid-template-columns: repeat(5, 1fr);
     gap: 14px; margin-bottom: 22px;
   }
   .kpi {
@@ -572,6 +572,11 @@
         <div class="kpi-label">Stock Value</div>
         <div class="kpi-value" id="kpi-value">—</div>
         <div class="kpi-meta" id="kpi-value-meta">at cost price</div>
+      </div>
+      <div class="kpi info">
+        <div class="kpi-label">Sold %</div>
+        <div class="kpi-value" id="kpi-soldpct">—</div>
+        <div class="kpi-meta" id="kpi-soldpct-meta">overall sell-through</div>
       </div>
     </div>
 
@@ -2834,6 +2839,7 @@
     const visible = applyFilters(supId, brId, q);
 
     let outCount = 0, reorderCount = 0, totalValue = 0;
+    let totalReceived = 0, totalSold = 0;
     items.forEach(i => {
       const s = getStock(i.id);
       const status = getStatus(i, s);
@@ -2841,12 +2847,22 @@
       else if (status === 'reorder' || status === 'low') reorderCount++;
       totalValue += s * (Number(i.cost) || 0);
     });
+    // Calculate overall sold % from all transactions
+    transactions.forEach(t => {
+      if (t.type === 'In') totalReceived += Number(t.qty);
+      else if (t.type === 'Out') totalSold += Number(t.qty);
+    });
+    const overallSoldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
+
     document.getElementById('kpi-total').textContent = items.length;
     document.getElementById('kpi-total-meta').textContent =
       `${suppliers.length} supplier${suppliers.length===1?'':'s'} · ${brands.length} brand${brands.length===1?'':'s'}`;
     document.getElementById('kpi-out').textContent = outCount;
     document.getElementById('kpi-reorder').textContent = reorderCount;
     document.getElementById('kpi-value').textContent = '₹' + fmtCompact(totalValue);
+    document.getElementById('kpi-soldpct').textContent = overallSoldPct + '%';
+    document.getElementById('kpi-soldpct-meta').textContent =
+      `${fmt(totalSold, 0)} of ${fmt(totalReceived, 0)} pcs sold`;
 
     const tbody = document.getElementById('dash-tbody');
     if (visible.length === 0) {
