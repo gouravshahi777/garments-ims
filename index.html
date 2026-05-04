@@ -1940,11 +1940,18 @@
       let valid = true;
       let reason = '';
       let action = ''; // 'add_existing' | 'create_new'
+      let isReturn = false; // negative qty in a sale = customer return → treat as Stock IN
 
       if (!skuCode) {
         valid = false; reason = 'Missing SKU/item identification';
-      } else if (isNaN(qty) || qty <= 0) {
-        valid = false; reason = 'Invalid quantity';
+      } else if (isNaN(qty) || qty === 0) {
+        valid = false; reason = 'Invalid quantity (zero or non-numeric)';
+      } else if (qty < 0) {
+        // Negative qty handling:
+        // - In a Sale upload: negative = customer return → Stock IN (qty becomes positive)
+        // - In a Purchase upload: negative = goods returned to supplier → Stock OUT (qty positive)
+        // Either way, flip the type and use absolute value.
+        isReturn = true;
       }
 
       // Try to match an existing SKU
@@ -2020,13 +2027,14 @@
       return {
         rowNum: idx + headerRowIdx + 2,
         sku: skuCode,
-        qty: isNaN(qty) ? 0 : qty,
+        qty: isNaN(qty) ? 0 : Math.abs(qty),  // Always positive — direction set by isReturn
         date,
         note,
         item,
         valid,
         reason,
         action,
+        isReturn,  // true if original qty was negative → flip In/Out direction
         // For preview display
         derivedInfo: derivedFromColumns ? {
           supplier: partyName,
@@ -2053,7 +2061,13 @@
     const total = parsedRows.length;
     const valid = parsedRows.filter(r => r.valid).length;
     const invalid = total - valid;
-    const totalQty = parsedRows.filter(r => r.valid).reduce((s, r) => s + r.qty, 0);
+    const returnCount = parsedRows.filter(r => r.valid && r.isReturn).length;
+    const normalCount = valid - returnCount;
+    // Total qty: returns are counted in the OPPOSITE direction
+    const totalQty = parsedRows.filter(r => r.valid).reduce((s, r) => {
+      return s + (r.isReturn ? 0 : r.qty);  // exclude returns from main "selling/receiving" count
+    }, 0);
+    const totalReturnQty = parsedRows.filter(r => r.valid && r.isReturn).reduce((s, r) => s + r.qty, 0);
 
     const newSupCount = pendingNewSuppliers.length;
     const newBrCount = pendingNewBrands.length;
@@ -2075,6 +2089,14 @@
           <div class="preview-stat-value">${fmt(totalQty)}</div>
         </div>
       </div>
+      ${returnCount > 0 ? `
+        <div style="background: rgba(88,166,255,0.08); border: 1px solid var(--info); border-radius: 8px; padding: 12px 14px; margin-top: 10px; font-size: 12px;">
+          <strong style="color: var(--info);">↩ ${returnCount} return row${returnCount===1?'':'s'} detected</strong>
+          <div style="margin-top: 6px; color: var(--text);">
+            ${fmt(totalReturnQty)} pieces will be added back to stock as ${uploadType === 'Out' ? 'customer returns (Stock IN)' : 'supplier returns (Stock OUT)'}.
+          </div>
+        </div>
+      ` : ''}
       ${hasNewEntities ? `
         <div style="background: var(--panel-2); border: 1px solid var(--accent); border-radius: 8px; padding: 12px 14px; margin-top: 10px; font-size: 12px;">
           <strong style="color: var(--accent);">New entities to be created:</strong>
@@ -2121,6 +2143,8 @@
             let statusBadge;
             if (!r.valid) {
               statusBadge = `<span class="row-status err" title="${escapeHtml(r.reason)}">Skip — ${escapeHtml(r.reason)}</span>`;
+            } else if (r.isReturn) {
+              statusBadge = `<span class="row-status" style="background: rgba(88,166,255,0.15); color: var(--info);">↩ Return → Stock IN</span>`;
             } else if (r.action === 'create_new') {
               statusBadge = `<span class="row-status" style="background: rgba(212,255,61,0.15); color: var(--accent);">Create + Import</span>`;
             } else {
@@ -2219,12 +2243,19 @@
         if (parsed) txTs = parsed.getTime() + i;
       }
       const itemId = r.item ? r.item.id : r.sku; // newly created SKU uses sku code as id
+
+      // Returns: flip the direction.
+      // - In a SALE upload (uploadType='Out') with negative qty → customer return → Stock IN
+      // - In a PURCHASE upload (uploadType='In') with negative qty → return to supplier → Stock OUT
+      const txType = r.isReturn ? (uploadType === 'Out' ? 'In' : 'Out') : uploadType;
+      const txNote = r.isReturn ? (r.note ? r.note + ' [RETURN]' : 'RETURN') : r.note;
+
       transactions.push({
         id: 't' + (ts + i).toString(36) + Math.random().toString(36).slice(2, 5),
         itemId,
-        type: uploadType,
-        qty: r.qty,
-        note: r.note,
+        type: txType,
+        qty: r.qty,  // already absolute value from processRows
+        note: txNote,
         ts: txTs
       });
     });
