@@ -1133,6 +1133,7 @@
         transactions = data.transactions || [];
         if (data.settings) settings = { ...settings, ...data.settings };
         isOnline = true;
+        bumpDataVersion();
         console.log(`✓ Loaded from Firebase: ${suppliers.length} suppliers, ${brands.length} brands, ${items.length} SKUs, ${transactions.length} transactions`);
       } else {
         // First-time use — create empty document
@@ -1155,12 +1156,16 @@
     }
   }
 
+  let lastSaveOk = true;
+
   async function saveAll() {
     if (!db || !isOnline) {
       console.warn('Firebase offline — save skipped');
       toast('⚠️ Offline — changes saved nahi hue. Internet connect karo.');
+      lastSaveOk = false;
       return;
     }
+    bumpDataVersion(); // invalidate stock cache
     // Queue saves so concurrent updates don't race
     saveQueue = saveQueue.then(async () => {
       try {
@@ -1174,9 +1179,17 @@
           updatedAt: firebase.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
         console.log('✓ Saved to Firebase');
+        lastSaveOk = true;
       } catch (err) {
         console.error('Firebase save failed:', err);
-        toast('⚠️ Cloud save fail ho gaya — internet check karo');
+        lastSaveOk = false;
+        if (err.message && err.message.includes('exceeds the maximum')) {
+          toast('⚠️ Data zyada hai (1MB limit) — kuch purana data delete karo');
+        } else if (err.code === 'permission-denied') {
+          toast('⚠️ Permission denied — Firestore rules check karo');
+        } else {
+          toast('⚠️ Cloud save fail ho gaya — internet check karo');
+        }
       }
     });
     return saveQueue;
@@ -1503,6 +1516,7 @@
         items = data.items || [];
         transactions = data.transactions || [];
         if (data.settings) settings = { ...settings, ...data.settings };
+        bumpDataVersion();
         // Re-check role since users list might have changed
         if (currentUser) {
           const users = getUsersTable();
@@ -2086,6 +2100,41 @@
     const valid = parsedRows.filter(r => r.valid);
     if (valid.length === 0) return;
 
+    // ============== DUPLICATE UPLOAD CHECK ==============
+    // Detect if this upload was already done by checking transactions for matching
+    // (itemId, qty, date) combinations. If 80%+ of rows already exist, warn user.
+    let duplicateCount = 0;
+    const recentTxKeys = new Set();
+    transactions.forEach(t => {
+      const dayKey = new Date(t.ts).toISOString().slice(0, 10);
+      recentTxKeys.add(`${t.itemId}|${t.qty}|${t.type}|${dayKey}`);
+    });
+    valid.forEach(r => {
+      const itemId = r.item ? r.item.id : r.sku;
+      let dayKey = new Date().toISOString().slice(0, 10);
+      if (r.date) {
+        const parsed = parseDate(r.date);
+        if (parsed) dayKey = parsed.toISOString().slice(0, 10);
+      }
+      const key = `${itemId}|${r.qty}|${uploadType}|${dayKey}`;
+      if (recentTxKeys.has(key)) duplicateCount++;
+    });
+
+    if (duplicateCount > 0) {
+      const pct = Math.round((duplicateCount / valid.length) * 100);
+      const msg = `⚠️ DUPLICATE WARNING\n\n${duplicateCount} out of ${valid.length} rows (${pct}%) look like they were already uploaded earlier.\n\nIf you import again, stock will be ${uploadType === 'In' ? 'ADDED' : 'REDUCED'} a SECOND time, making your numbers wrong.\n\nDo you want to continue anyway?\n\n(Click Cancel and check Activity tab if unsure)`;
+      if (!confirm(msg)) return;
+    }
+
+    // ============== FIREBASE SIZE LIMIT CHECK ==============
+    // Firestore has a 1 MB limit per document. Estimate size after this import.
+    const projectedTransactions = transactions.length + valid.length;
+    const estimatedSizeKB = Math.round((projectedTransactions * 0.18) + (items.length * 0.3) + 5);
+    if (estimatedSizeKB > 900) {
+      const msg = `⚠️ STORAGE LIMIT WARNING\n\nAfter this import, your data will be approximately ${estimatedSizeKB} KB.\n\nFirebase free plan has a 1024 KB (1 MB) limit per document. If you exceed this, the cloud save will FAIL and you may lose data.\n\nCurrent transactions: ${transactions.length}\nAfter import: ${projectedTransactions}\n\nRecommendation:\n• Don't import old historical data — only recent sales\n• Or delete old transactions in Activity tab first\n\nContinue anyway? (Risky)`;
+      if (!confirm(msg)) return;
+    }
+
     // Apply pending new entities first
     pendingNewSuppliers.forEach(s => {
       if (!suppliers.find(x => x.id === s.id)) suppliers.push({ ...s, contact: '', phone: '', notes: '', lt: null, sf: null });
@@ -2120,7 +2169,25 @@
     pendingNewBrands = [];
     pendingNewSkus = [];
 
+    // Show progress for big imports
+    const isBigImport = valid.length > 1000;
+    if (isBigImport) {
+      showLoadingOverlay(`Saving ${fmt(valid.length)} rows to cloud...`);
+    }
+
     await saveAll();
+
+    if (isBigImport) hideLoadingOverlay();
+
+    if (!lastSaveOk) {
+      // Save failed — undo the local changes so user can retry
+      // Remove the transactions we just added
+      transactions.splice(transactions.length - valid.length, valid.length);
+      alert('⚠️ Cloud save fail ho gaya!\n\nReasons:\n• Internet down\n• Data 1 MB limit cross kar gaya\n• Firestore rules block kar rahe hain\n\nUpload cancel ho gaya. Browser console (F12) mein details dekho.');
+      renderAll();
+      return;
+    }
+
     closeModal('upload-modal');
     renderAll();
     switchTab('livestock');
@@ -2266,14 +2333,34 @@
   }
 
   // ============== CALCULATIONS ==============
-  function getStock(itemId) {
-    const item = items.find(i => i.id === itemId);
-    if (!item) return 0;
-    let stock = Number(item.startStock || 0);
+  // Cache stock by itemId — rebuilt whenever transactions change.
+  // This is critical for performance: without caching, getStock runs O(N×M)
+  // where N=items and M=transactions, freezing the browser at ~10K transactions.
+  let stockCache = null;
+  let stockCacheVersion = -1;
+  let dataVersion = 0; // bumped whenever transactions/items change
+
+  function bumpDataVersion() { dataVersion++; }
+
+  function buildStockCache() {
+    const cache = new Map();
+    // Initialize with startStock
+    items.forEach(i => cache.set(i.id, Number(i.startStock || 0)));
+    // Apply all transactions in one pass
     transactions.forEach(t => {
-      if (t.itemId === itemId) stock += t.type === 'In' ? Number(t.qty) : -Number(t.qty);
+      const cur = cache.get(t.itemId);
+      if (cur === undefined) return; // item was deleted
+      cache.set(t.itemId, cur + (t.type === 'In' ? Number(t.qty) : -Number(t.qty)));
     });
-    return stock;
+    stockCache = cache;
+    stockCacheVersion = dataVersion;
+  }
+
+  function getStock(itemId) {
+    if (stockCacheVersion !== dataVersion || !stockCache) {
+      buildStockCache();
+    }
+    return stockCache.get(itemId) ?? 0;
   }
 
   // ----- LT/SF live on the Supplier only -----
@@ -2300,14 +2387,30 @@
   // If any batch sold ≥ thresholdPct% of its received qty within that window,
   // SKU is fast-moving → flag for reorder.
   // Returns { triggered, batches: [{ts, received, soldInWindow, pct, thresholdMet}] }
+  // Cache for getVelocityCheck — same dataVersion as stockCache.
+  let txByItemCache = null;
+  let txByItemVersion = -1;
+  function buildTxByItemCache() {
+    const map = new Map();
+    transactions.forEach(t => {
+      if (!map.has(t.itemId)) map.set(t.itemId, []);
+      map.get(t.itemId).push(t);
+    });
+    // Sort each item's transactions by timestamp (ascending)
+    map.forEach(arr => arr.sort((a, b) => a.ts - b.ts));
+    txByItemCache = map;
+    txByItemVersion = dataVersion;
+  }
+
   function getVelocityCheck(itemId) {
     const windowDays = Number(settings.velocityDays) || 30;
     const thresholdPct = Number(settings.velocityPct) || 50;
     const windowMs = windowDays * 24 * 60 * 60 * 1000;
 
-    const itemTx = transactions
-      .filter(t => t.itemId === itemId)
-      .sort((a, b) => a.ts - b.ts);
+    if (txByItemVersion !== dataVersion || !txByItemCache) {
+      buildTxByItemCache();
+    }
+    const itemTx = txByItemCache.get(itemId) || [];
 
     const batches = [];
     itemTx.forEach(tx => {
@@ -2339,8 +2442,6 @@
     const latest = batches[batches.length - 1];
     let triggered = false;
     if (latest && latest.thresholdMet) {
-      // For mid-window batches not yet 30 days old, threshold met early = strong signal
-      // For ended windows, threshold met = still fast-moving
       triggered = true;
     }
 
@@ -2529,7 +2630,13 @@
       return;
     }
 
-    tbody.innerHTML = filtered.map(r => {
+    // Performance cap: 500 rows max
+    const MAX_LS = 500;
+    const allFilteredCount = filtered.length;
+    const displayRows = filtered.slice(0, MAX_LS);
+    const lsTruncated = allFilteredCount > MAX_LS;
+
+    tbody.innerHTML = displayRows.map(r => {
       const i = r.item;
       const b = getBrand(i.brandId);
       // Color stock number red if 0, orange if low/reorder, white otherwise
@@ -2551,7 +2658,7 @@
           <td><span class="pill ${r.status}">${statusLabel(r.status)}</span></td>
         </tr>
       `;
-    }).join('');
+    }).join('') + (lsTruncated ? `<tr><td colspan="4" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing ${MAX_LS} of ${fmt(allFilteredCount)} items. Use search/filter to find specific ones.</td></tr>` : '');
   }
 
   function renderDashboard() {
@@ -2580,7 +2687,13 @@
       tbody.innerHTML = `<tr><td colspan="7"><div class="empty"><div class="empty-icon">📦</div>No SKUs match. Adjust filters or add an SKU.</div></td></tr>`;
       return;
     }
-    tbody.innerHTML = visible.map(i => {
+    // Performance cap: 500 rows max
+    const MAX_DASH = 500;
+    const dashTotalCount = visible.length;
+    const displayDash = visible.slice(0, MAX_DASH);
+    const dashTruncated = dashTotalCount > MAX_DASH;
+
+    tbody.innerHTML = displayDash.map(i => {
       const stock = getStock(i.id);
       const rop = getROP(i);
       const status = getStatus(i, stock);
@@ -2612,7 +2725,7 @@
           <td><span class="pill ${status}">${statusLabel(status)}</span></td>
         </tr>
       `;
-    }).join('');
+    }).join('') + (dashTruncated ? `<tr><td colspan="7" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing ${MAX_DASH} of ${fmt(dashTotalCount)} SKUs. Use search/filter to find specific items.</td></tr>` : '');
   }
 
   function renderSuppliers() {
@@ -2781,12 +2894,17 @@
     const supId = document.getElementById('inv-supplier').value;
     const brId = document.getElementById('inv-brand').value;
     const q = document.getElementById('inv-search').value;
-    const visible = applyFilters(supId, brId, q);
+    const allVisible = applyFilters(supId, brId, q);
     const tbody = document.getElementById('inv-tbody');
-    if (visible.length === 0) {
+    if (allVisible.length === 0) {
       tbody.innerHTML = `<tr><td colspan="12"><div class="empty"><div class="empty-icon">📋</div>No SKUs.</div></td></tr>`;
       return;
     }
+    // Performance cap: 500 rows max
+    const MAX = 500;
+    const visible = allVisible.slice(0, MAX);
+    const truncated = allVisible.length > MAX;
+
     tbody.innerHTML = visible.map(i => {
       const stock = getStock(i.id);
       const status = getStatus(i, stock);
@@ -2820,7 +2938,7 @@
           </td>
         </tr>
       `;
-    }).join('');
+    }).join('') + (truncated ? `<tr><td colspan="12" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing ${MAX} of ${fmt(allVisible.length)} SKUs. Use search/filter to find specific items.</td></tr>` : '');
   }
 
   // Returns { regular, fastMovers } — regular excludes fast movers so they only show in one tab.
@@ -2939,7 +3057,7 @@
     const brId = document.getElementById('act-brand').value;
     const q = (document.getElementById('act-search').value || '').toLowerCase().trim();
     const tbody = document.getElementById('act-tbody');
-    const rows = transactions.slice().sort((a,b) => b.ts - a.ts)
+    const allRows = transactions.slice().sort((a,b) => b.ts - a.ts)
       .map(t => ({ ...t, item: items.find(i => i.id === t.itemId) }))
       .filter(t => t.item)
       .filter(t => {
@@ -2950,6 +3068,13 @@
         if (q && !`${t.item.name} ${b.name} ${t.item.id} ${t.note || ''}`.toLowerCase().includes(q)) return false;
         return true;
       });
+
+    // Performance cap: only render last 500 transactions to keep browser responsive
+    const MAX_ACTIVITY = 500;
+    const totalCount = allRows.length;
+    const rows = allRows.slice(0, MAX_ACTIVITY);
+    const truncated = totalCount > MAX_ACTIVITY;
+
     if (rows.length === 0) {
       tbody.innerHTML = `<tr><td colspan="6"><div class="empty"><div class="empty-icon">📜</div>No activity yet.</div></td></tr>`;
       return;
@@ -2969,7 +3094,7 @@
           <td style="text-align:right"><button class="btn btn-danger btn-sm" onclick="deleteTransaction('${t.id}')">×</button></td>
         </tr>
       `;
-    }).join('');
+    }).join('') + (truncated ? `<tr><td colspan="6" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing latest ${MAX_ACTIVITY} of ${fmt(totalCount)} transactions. Use search/filter to find older ones.</td></tr>` : '');
   }
 
   function switchTab(name) {
