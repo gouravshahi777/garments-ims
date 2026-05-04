@@ -2594,13 +2594,35 @@
       const pct = tx.qty > 0 ? (credited / Number(tx.qty)) * 100 : 0;
       const windowEnded = Date.now() >= batchEnd;
       const thresholdMet = pct >= thresholdPct;
+
+      // FIND the actual day when threshold was crossed (cumulative sale)
+      // This is critical for "Fast Mover" detection — we want SKUs where threshold
+      // was hit STRICTLY BEFORE windowDays, not at exactly windowDays.
+      let daysToThreshold = null;
+      if (thresholdMet) {
+        const targetQty = (thresholdPct / 100) * Number(tx.qty);
+        let cumulative = 0;
+        // Get sales after this batch in chronological order
+        const salesAfterBatch = itemTx
+          .filter(t => t.type === 'Out' && t.ts >= tx.ts && t.ts <= batchEnd)
+          .sort((a, b) => a.ts - b.ts);
+        for (const sale of salesAfterBatch) {
+          cumulative += Number(sale.qty);
+          if (cumulative >= targetQty) {
+            daysToThreshold = (sale.ts - tx.ts) / (24 * 60 * 60 * 1000);
+            break;
+          }
+        }
+      }
+
       batches.push({
         ts: tx.ts,
         received: Number(tx.qty),
         soldInWindow: credited,
         pct,
         windowEnded,
-        thresholdMet
+        thresholdMet,
+        daysToThreshold  // null if threshold not met, otherwise actual days taken
       });
     });
 
@@ -2609,11 +2631,18 @@
     // also hit the threshold within the window. So we look at the LATEST batch only.
     const latest = batches[batches.length - 1];
     let triggered = false;
+    let isTrueFastMover = false;
     if (latest && latest.thresholdMet) {
       triggered = true;
+      // TRUE FAST MOVER: threshold hit STRICTLY BEFORE windowDays (not at exactly windowDays)
+      // Example: 75% in 15 days = fast mover (15 < 20)
+      // Example: 75% in 20 days = NOT fast mover (just regular reorder)
+      if (latest.daysToThreshold !== null && latest.daysToThreshold < windowDays) {
+        isTrueFastMover = true;
+      }
     }
 
-    return { triggered, batches };
+    return { triggered, isTrueFastMover, batches };
   }
   function getStatus(item, stock) {
     const rop = getROP(item);
@@ -3136,9 +3165,7 @@
     // REORDER LIST: includes EVERYTHING that needs ordering
     // - Out of stock items
     // - Below reorder point items
-    // - Fast movers (even with stock — kyunki order karna chahiye supplier ko)
-    // Fast movers will appear in BOTH Reorder List AND Fast Movers tab
-    // (user requested: "dono jagah dikhe")
+    // - Velocity triggered items (regardless of speed)
     const regular = all.filter(r =>
       r.status === 'outofstock' ||
       r.status === 'reorder' ||
@@ -3146,8 +3173,12 @@
       r.velocity.triggered
     );
 
-    // FAST MOVERS: velocity triggered (regardless of stock level)
-    const fastMovers = all.filter(r => r.velocity.triggered);
+    // FAST MOVERS: ONLY truly fast — items that hit the % threshold STRICTLY BEFORE
+    // the windowDays. Example with settings 75% / 20 days:
+    //   75% sold in 15 days → fast mover ⚡
+    //   75% sold in 20 days → NOT a fast mover (regular reorder)
+    //   75% sold in 25 days → NOT a fast mover (slow reorder)
+    const fastMovers = all.filter(r => r.velocity.isTrueFastMover);
 
     const order = { outofstock: 0, reorder: 1, low: 2, healthy: 3, overstock: 4 };
     fastMovers.sort((a, b) => order[a.status] - order[b.status]);
@@ -3179,7 +3210,7 @@
     // Update the explainer with current settings
     const expl = document.getElementById('fm-explainer');
     if (expl) {
-      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% or more of the last batch sold within ${settings.velocityDays} days. Suggested order = last batch × ${settings.fastMoverMultiplier} (so you stock up before they run out).`;
+      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% or more of the last batch sold in <strong>LESS than ${settings.velocityDays} days</strong> (very fast sellers). Suggested order = last batch × ${settings.fastMoverMultiplier}. Items that took exactly ${settings.velocityDays}+ days appear only in Reorder List.`;
     }
 
     document.getElementById('fm-count').textContent =
