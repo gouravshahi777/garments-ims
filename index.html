@@ -2332,7 +2332,7 @@
     // Build rows
     const headers = [
       'Supplier', 'Supplier Phone', 'Brand', 'SKU Code', 'Item', 'Size', 'Color',
-      'Total Received', 'Total Sold', 'Sold %', 'Current Stock',
+      'Total Received', 'Total Sold', 'Sold in Days', 'Sold %', 'Current Stock',
       'Order Qty', 'MOQ', 'Max Level', 'Lead Time (days)', 'Reason'
     ];
 
@@ -2342,14 +2342,26 @@
       const sup = getItemSupplier(i);
       const orderQty = Math.ceil(getReorderQty(i, r.stock));
 
-      // Calculate total received (purchases) and total sold (sales) for this item
+      // Calculate total received, total sold, and days span (first purchase → last sale)
       let totalReceived = 0;
       let totalSold = 0;
+      let firstPurchaseTs = null;
+      let lastSaleTs = 0;
       transactions.forEach(t => {
         if (t.itemId !== i.id) return;
-        if (t.type === 'In') totalReceived += Number(t.qty);
-        else if (t.type === 'Out') totalSold += Number(t.qty);
+        if (t.type === 'In') {
+          totalReceived += Number(t.qty);
+          if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+        } else if (t.type === 'Out') {
+          totalSold += Number(t.qty);
+          if (t.ts > lastSaleTs) lastSaleTs = t.ts;
+        }
       });
+      let daysSpan = 0;
+      if (firstPurchaseTs !== null) {
+        const endTs = lastSaleTs > 0 ? lastSaleTs : Date.now();
+        daysSpan = Math.max(1, Math.round((endTs - firstPurchaseTs) / (24 * 60 * 60 * 1000)));
+      }
       const soldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
 
       return [
@@ -2362,11 +2374,12 @@
         i.color || '',
         totalReceived,
         totalSold,
+        daysSpan > 0 && totalSold > 0 ? daysSpan : '',
         soldPct + '%',
         Math.round(r.stock),
         orderQty,
-        Number(i.moq || 0),
-        Number(i.max || 0),
+        getEffectiveMOQ(i),
+        getEffectiveMax(i),
         getBrandLT(i) || '',
         getReorderReason(i, r.stock)
       ];
@@ -2378,7 +2391,7 @@
     ws['!cols'] = [
       { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 22 },
       { wch: 8 },  { wch: 12 },
-      { wch: 14 }, { wch: 12 }, { wch: 9 },  // Total Received, Total Sold, Sold %
+      { wch: 14 }, { wch: 12 }, { wch: 11 }, { wch: 9 },  // Total Received, Total Sold, Sold in Days, Sold %
       { wch: 13 }, { wch: 11 }, { wch: 8 },
       { wch: 11 }, { wch: 14 }, { wch: 36 }
     ];
@@ -2451,7 +2464,85 @@
   const getBrandSF = getSupplierSF;
 
   function getROP(item) {
-    return (Number(item.adc) || 0) * getSupplierLT(item) * getSupplierSF(item);
+    // Old way: ADC × LT × SF (all manually set)
+    const manualROP = (Number(item.adc) || 0) * getSupplierLT(item) * getSupplierSF(item);
+    if (manualROP > 0) return manualROP;
+
+    // NEW: Auto-calculate from transaction history if manual values not set
+    // Uses Average Daily Sale × 30 days (monthly safety stock)
+    const auto = getAutoStats(item.id);
+    return auto.avgDailySale * 30;
+  }
+
+  // ============== AUTO-CALCULATE FROM TRANSACTIONS ==============
+  // For users who haven't set Max Level / MOQ / Lead Time manually,
+  // we calculate sensible defaults from their actual sales history.
+  // This is critical for non-technical users — they shouldn't have to fill
+  // 10 fields per SKU. Just upload purchase + sale → app figures it out.
+  let autoStatsCache = null;
+  let autoStatsVersion = -1;
+
+  function getAutoStats(itemId) {
+    // Cache by dataVersion (same as stockCache) for performance
+    if (autoStatsVersion !== dataVersion || !autoStatsCache) {
+      autoStatsCache = new Map();
+      autoStatsVersion = dataVersion;
+    }
+    if (autoStatsCache.has(itemId)) return autoStatsCache.get(itemId);
+
+    let totalReceived = 0;
+    let totalSold = 0;
+    let firstPurchaseTs = null;
+    let lastBatchQty = 0;
+    let lastBatchTs = 0;
+
+    transactions.forEach(t => {
+      if (t.itemId !== itemId) return;
+      if (t.type === 'In') {
+        totalReceived += Number(t.qty);
+        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+        if (t.ts > lastBatchTs) {
+          lastBatchTs = t.ts;
+          lastBatchQty = Number(t.qty);
+        }
+      } else if (t.type === 'Out') {
+        totalSold += Number(t.qty);
+      }
+    });
+
+    // Calculate daily sale rate based on actual data
+    let avgDailySale = 0;
+    if (totalSold > 0 && firstPurchaseTs !== null) {
+      const daysSinceFirst = Math.max(1, (Date.now() - firstPurchaseTs) / (24 * 60 * 60 * 1000));
+      avgDailySale = totalSold / daysSinceFirst;
+    }
+
+    const stats = {
+      totalReceived,
+      totalSold,
+      avgDailySale,
+      lastBatchQty,
+      // Auto-calculated suggestions:
+      autoMaxLevel: Math.ceil(avgDailySale * 60),  // 2 months supply
+      autoMOQ: lastBatchQty,                        // re-order what you ordered before
+      autoReorderThreshold: avgDailySale * 30       // 1 month safety
+    };
+    autoStatsCache.set(itemId, stats);
+    return stats;
+  }
+
+  // Helper to get effective Max Level (manual or auto)
+  function getEffectiveMax(item) {
+    const manual = Number(item.max || 0);
+    if (manual > 0) return manual;
+    return getAutoStats(item.id).autoMaxLevel;
+  }
+
+  // Helper to get effective MOQ (manual or auto)
+  function getEffectiveMOQ(item) {
+    const manual = Number(item.moq || 0);
+    if (manual > 0) return manual;
+    return getAutoStats(item.id).autoMOQ;
   }
 
   // ----- Velocity-based reorder check -----
@@ -2552,7 +2643,10 @@
   //   "You sold most of 4 pieces fast → next time order 8."
   // We always honor MOQ as a floor.
   function getReorderQty(item, stock) {
-    const baseRefill = Math.max(Number(item.moq || 0), Number(item.max || 0) - stock);
+    // Use effective values (manual if set, auto-calculated if not)
+    const effMOQ = getEffectiveMOQ(item);
+    const effMax = getEffectiveMax(item);
+    const baseRefill = Math.max(effMOQ, effMax - stock);
     const v = getVelocityCheck(item.id);
     if (v.triggered && v.batches.length > 0) {
       const lastBatch = v.batches[v.batches.length - 1];
@@ -3096,11 +3190,24 @@
     // Calculate total received and total sold for this item (lifetime)
     let totalReceived = 0;
     let totalSold = 0;
+    let firstPurchaseTs = null;  // earliest IN transaction
+    let lastSaleTs = 0;          // latest OUT transaction
     transactions.forEach(t => {
       if (t.itemId !== i.id) return;
-      if (t.type === 'In') totalReceived += Number(t.qty);
-      else if (t.type === 'Out') totalSold += Number(t.qty);
+      if (t.type === 'In') {
+        totalReceived += Number(t.qty);
+        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+      } else if (t.type === 'Out') {
+        totalSold += Number(t.qty);
+        if (t.ts > lastSaleTs) lastSaleTs = t.ts;
+      }
     });
+    // Days span: from first purchase to last sale (or today if no sales yet)
+    let daysSpan = 0;
+    if (firstPurchaseTs !== null) {
+      const endTs = lastSaleTs > 0 ? lastSaleTs : Date.now();
+      daysSpan = Math.max(1, Math.round((endTs - firstPurchaseTs) / (24 * 60 * 60 * 1000)));
+    }
     const soldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
     // Color code the sold % to give visual feedback
     let soldPctColor = 'var(--good)';
@@ -3129,10 +3236,3556 @@
         <div class="reorder-card-stats">
           <div class="stat-block"><div class="stat-label">Current Stock</div><div class="stat-value">${fmt(r.stock, 0)}</div></div>
           <div class="stat-block"><div class="stat-label">Total Received</div><div class="stat-value">${fmt(totalReceived, 0)}</div></div>
-          <div class="stat-block"><div class="stat-label">Total Sold</div><div class="stat-value" style="color:${soldPctColor};">${fmt(totalSold, 0)} <span style="font-size:11px; opacity:0.8;">(${soldPct}%)</span></div></div>
-          <div class="stat-block"><div class="stat-label">Max Level</div><div class="stat-value">${fmt(i.max, 0)}</div></div>
-          <div class="stat-block"><div class="stat-label">MOQ</div><div class="stat-value">${fmt(i.moq, 0)}</div></div>
-          <div class="stat-block"><div class="stat-label">Lead Time</div><div class="stat-value">${getBrandLT(i) > 0 ? getBrandLT(i)+'d' : '—'}</div></div>
+          <div class="stat-block"><div class="stat-label">Total Sold</div><div class="stat-value" style="color:${soldPctColor};">${fmt(totalSold, 0)} <span style="font-size:11px; opacity:0.8;">(${soldPct}%)</span></div>${daysSpan > 0 && totalSold > 0 ? `<div style="font-size:10px; color:var(--text-dim); margin-top:2px;">in ${daysSpan} day${daysSpan===1?'':'s'}</div>` : ''}</div>
+          <div class="stat-block"><div class="stat-label">Max Level${Number(i.max||0) > 0 ? '' : ' <span style="color:var(--text-dim); font-size:9px;">(auto)</span>'}</div><div class="stat-value">${fmt(getEffectiveMax(i), 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">MOQ${Number(i.moq||0) > 0 ? '' : ' <span style="color:var(--text-dim); font-size:9px;">(auto)</span>'}</div><div class="stat-value">${fmt(getEffectiveMOQ(i), 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">Lead Time</div><div class="stat-value">${getBrandLT(i) > 0 ? getBrandLT(i)+'d' : '<span style="font-size:11px; color:var(--text-dim);">not set</span>'}</div></div>
+        </div>
+        <div class="reorder-card-cta" ${kind === 'fastmover' ? 'style="background: var(--accent);"' : ''}>
+          Order ${fmt(rq, 0)} pieces
+          ${kind === 'fastmover' && latest ? `<div style="font-size:10px; opacity:0.75; font-weight:500; margin-top:3px;">Fast mover · ${settings.fastMoverMultiplier}× of ${fmt(latest.received)}</div>` : ''}
+        </div>
+        ${sup ? `<div class="supplier-line">📞 <strong>${escapeHtml(sup.name)}</strong> ${sup.contact ? '· ' + escapeHtml(sup.contact) : ''} ${sup.phone ? '· ' + escapeHtml(sup.phone) : ''}</div>` : ''}
+      </div>
+    `;
+  }
+
+  function renderActivity() {
+    const supId = document.getElementById('act-supplier').value;
+    const brId = document.getElementById('act-brand').value;
+    const q = (document.getElementById('act-search').value || '').toLowerCase().trim();
+    const tbody = document.getElementById('act-tbody');
+    const allRows = transactions.slice().sort((a,b) => b.ts - a.ts)
+      .map(t => ({ ...t, item: items.find(i => i.id === t.itemId) }))
+      .filter(t => t.item)
+      .filter(t => {
+        const b = getBrand(t.item.brandId);
+        if (!b) return false;
+        if (supId !== 'all' && b.supplierId !== supId) return false;
+        if (brId !== 'all' && t.item.brandId !== brId) return false;
+        if (q && !`${t.item.name} ${b.name} ${t.item.id} ${t.note || ''}`.toLowerCase().includes(q)) return false;
+        return true;
+      });
+
+    // Performance cap: only render last 500 transactions to keep browser responsive
+    const MAX_ACTIVITY = 500;
+    const totalCount = allRows.length;
+    const rows = allRows.slice(0, MAX_ACTIVITY);
+    const truncated = totalCount > MAX_ACTIVITY;
+
+    if (rows.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6"><div class="empty"><div class="empty-icon">📜</div>No activity yet.</div></td></tr>`;
+      return;
+    }
+    tbody.innerHTML = rows.map(t => {
+      const b = getBrand(t.item.brandId);
+      return `
+        <tr>
+          <td><span style="color:var(--text-dim); font-family: 'Geist Mono', monospace; font-size:11px;">${formatTime(t.ts)}</span></td>
+          <td>
+            <div>${escapeHtml(t.item.name)} ${t.item.size ? `<span class="size-tag">${escapeHtml(t.item.size)}</span>` : ''} ${t.item.color ? `<span class="color-tag">${escapeHtml(t.item.color)}</span>` : ''}</div>
+            ${t.note ? `<div style="font-size:11px; color:var(--text-dim); margin-top:2px;">${escapeHtml(t.note)}</div>` : ''}
+          </td>
+          <td>${escapeHtml(b?.name || '—')}</td>
+          <td><span class="activity-tag ${t.type === 'In' ? 'in' : 'out'}">${t.type === 'In' ? '↓ IN' : '↑ OUT'}</span></td>
+          <td class="num"><strong>${t.type === 'In' ? '+' : '−'}${fmt(t.qty, 0)}</strong></td>
+          <td style="text-align:right"><button class="btn btn-danger btn-sm" onclick="deleteTransaction('${t.id}')">×</button></td>
+        </tr>
+      `;
+    }).join('') + (truncated ? `<tr><td colspan="6" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing latest ${MAX_ACTIVITY} of ${fmt(totalCount)} transactions. Use search/filter to find older ones.</td></tr>` : '');
+  }
+
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+    document.querySelectorAll('.tab-content').forEach(c => {
+      c.style.display = c.id === `tab-${name}` ? 'block' : 'none';
+    });
+  }
+
+  // ITEM MODAL
+  function openItemModal(id = null) {
+    if (brands.length === 0) { alert('Please add at least one Brand first (and a Supplier).'); return; }
+    editingId = id;
+    document.getElementById('item-modal-title').textContent = id ? 'Edit SKU' : 'Add SKU';
+    const brandSel = document.getElementById('m-brand');
+    brandSel.innerHTML = brands.map(b => {
+      const sup = getSupplier(b.supplierId);
+      return `<option value="${b.id}">${escapeHtml(b.name)} (${escapeHtml(sup?.name || '—')})</option>`;
+    }).join('');
+    const fields = ['m-name','m-category','m-size','m-color','m-cost','m-sell','m-adc','m-moq','m-max','m-stock'];
+    if (id) {
+      const it = items.find(i => i.id === id);
+      brandSel.value = it.brandId;
+      document.getElementById('m-name').value = it.name || '';
+      document.getElementById('m-category').value = it.category || '';
+      document.getElementById('m-size').value = it.size || '';
+      document.getElementById('m-color').value = it.color || '';
+      document.getElementById('m-cost').value = it.cost ?? '';
+      document.getElementById('m-sell').value = it.sell ?? '';
+      document.getElementById('m-adc').value = it.adc ?? '';
+      document.getElementById('m-moq').value = it.moq ?? '';
+      document.getElementById('m-max').value = it.max ?? '';
+      document.getElementById('m-stock').value = it.startStock ?? '';
+    } else {
+      fields.forEach(f => document.getElementById(f).value = '');
+    }
+    document.getElementById('item-modal').classList.add('active');
+  }
+  function editItem(id) { openItemModal(id); }
+  async function deleteItem(id) {
+    const it = items.find(i => i.id === id);
+    if (!it || !confirm(`Delete "${it.name}"? Its transactions will also be removed.`)) return;
+    items = items.filter(i => i.id !== id);
+    transactions = transactions.filter(t => t.itemId !== id);
+    await saveAll();
+    renderAll();
+    toast('SKU deleted');
+  }
+  async function saveItem() {
+    const data = {
+      brandId: document.getElementById('m-brand').value,
+      name: document.getElementById('m-name').value.trim(),
+      category: document.getElementById('m-category').value.trim(),
+      size: document.getElementById('m-size').value.trim(),
+      color: document.getElementById('m-color').value.trim(),
+      cost: parseFloat(document.getElementById('m-cost').value) || 0,
+      sell: parseFloat(document.getElementById('m-sell').value) || 0,
+      adc: parseFloat(document.getElementById('m-adc').value) || 0,
+      moq: parseFloat(document.getElementById('m-moq').value) || 0,
+      max: parseFloat(document.getElementById('m-max').value) || 0,
+      startStock: parseFloat(document.getElementById('m-stock').value) || 0,
+    };
+    if (!data.name) { alert('Item name is required'); return; }
+    if (!data.brandId) { alert('Pick a brand'); return; }
+    if (editingId) {
+      const idx = items.findIndex(i => i.id === editingId);
+      items[idx] = { ...items[idx], ...data };
+      // Strip any old lt/sf on the item
+      delete items[idx].lt;
+      delete items[idx].sf;
+      toast('SKU updated');
+    } else {
+      const id = 'i' + Date.now().toString(36);
+      items.push({ id, ...data });
+      toast('SKU added');
+    }
+    await saveAll();
+    closeModal('item-modal');
+    renderAll();
+  }
+
+  // SUPPLIER MODAL
+  function openSupplierModal(id = null) {
+    editingId = id;
+    document.getElementById('supplier-modal-title').textContent = id ? 'Edit Supplier' : 'Add Supplier';
+    if (id) {
+      const s = getSupplier(id);
+      document.getElementById('s-name').value = s.name || '';
+      document.getElementById('s-contact').value = s.contact || '';
+      document.getElementById('s-phone').value = s.phone || '';
+      document.getElementById('s-notes').value = s.notes || '';
+      document.getElementById('s-lt').value = s.lt ?? '';
+      document.getElementById('s-sf').value = s.sf ?? '';
+    } else {
+      ['s-name','s-contact','s-phone','s-notes','s-lt','s-sf'].forEach(f => document.getElementById(f).value = '');
+    }
+    document.getElementById('supplier-modal').classList.add('active');
+  }
+  function editSupplier(id) { openSupplierModal(id); }
+  async function deleteSupplier(id) {
+    const s = getSupplier(id);
+    if (!s) return;
+    const supBrands = brands.filter(b => b.supplierId === id);
+    const supItems = items.filter(i => {
+      const b = getBrand(i.brandId);
+      return b && b.supplierId === id;
+    });
+    if (!confirm(`Delete supplier "${s.name}"? This will also remove ${supBrands.length} brand(s) and ${supItems.length} SKU(s).`)) return;
+    suppliers = suppliers.filter(x => x.id !== id);
+    const removedBrands = supBrands.map(b => b.id);
+    brands = brands.filter(b => b.supplierId !== id);
+    const removedItems = supItems.map(i => i.id);
+    items = items.filter(i => !removedBrands.includes(i.brandId));
+    transactions = transactions.filter(t => !removedItems.includes(t.itemId));
+    currentSupplierFocus = null;
+    await saveAll();
+    renderAll();
+    toast('Supplier deleted');
+  }
+  async function saveSupplier() {
+    const ltVal = document.getElementById('s-lt').value;
+    const sfVal = document.getElementById('s-sf').value;
+    const data = {
+      name: document.getElementById('s-name').value.trim(),
+      contact: document.getElementById('s-contact').value.trim(),
+      phone: document.getElementById('s-phone').value.trim(),
+      notes: document.getElementById('s-notes').value.trim(),
+      lt: ltVal === '' ? null : parseFloat(ltVal),
+      sf: sfVal === '' ? null : parseFloat(sfVal)
+    };
+    if (!data.name) { alert('Supplier name is required'); return; }
+    if (editingId) {
+      const i = suppliers.findIndex(s => s.id === editingId);
+      suppliers[i] = { ...suppliers[i], ...data };
+      toast('Supplier updated');
+    } else {
+      suppliers.push({ id: 's' + Date.now().toString(36), ...data });
+      toast('Supplier added');
+    }
+    await saveAll();
+    closeModal('supplier-modal');
+    renderAll();
+  }
+
+  // BRAND MODAL
+  function openBrandModal(id = null) {
+    if (suppliers.length === 0) { alert('Please add at least one Supplier first.'); return; }
+    editingId = id;
+    document.getElementById('brand-modal-title').textContent = id ? 'Edit Brand' : 'Add Brand';
+    const supSel = document.getElementById('b-supplier');
+    supSel.innerHTML = suppliers.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+    if (id) {
+      const b = getBrand(id);
+      document.getElementById('b-name').value = b.name || '';
+      supSel.value = b.supplierId;
+    } else {
+      document.getElementById('b-name').value = '';
+    }
+    document.getElementById('brand-modal').classList.add('active');
+  }
+  function editBrand(id) { openBrandModal(id); }
+  async function deleteBrand(id) {
+    const b = getBrand(id);
+    if (!b) return;
+    const brandItems = items.filter(i => i.brandId === id);
+    if (!confirm(`Delete brand "${b.name}"? This will also remove ${brandItems.length} SKU(s).`)) return;
+    brands = brands.filter(x => x.id !== id);
+    const removed = brandItems.map(i => i.id);
+    items = items.filter(i => i.brandId !== id);
+    transactions = transactions.filter(t => !removed.includes(t.itemId));
+    currentBrandFocus = null;
+    await saveAll();
+    renderAll();
+    toast('Brand deleted');
+  }
+  async function saveBrand() {
+    const data = {
+      name: document.getElementById('b-name').value.trim(),
+      supplierId: document.getElementById('b-supplier').value
+    };
+    if (!data.name) { alert('Brand name is required'); return; }
+    if (!data.supplierId) { alert('Pick a supplier'); return; }
+    if (editingId) {
+      const i = brands.findIndex(b => b.id === editingId);
+      brands[i] = { ...brands[i], ...data };
+      toast('Brand updated');
+    } else {
+      brands.push({ id: 'b' + Date.now().toString(36), ...data });
+      toast('Brand added');
+    }
+    await saveAll();
+    closeModal('brand-modal');
+    renderAll();
+  }
+
+  async function deleteTransaction(id) {
+    if (!confirm('Delete this transaction?')) return;
+    transactions = transactions.filter(t => t.id !== id);
+    await saveAll();
+    renderAll();
+    toast('Transaction deleted');
+  }
+
+  function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+  // ============== HELPERS ==============
+  function fmt(n, dec = 0) {
+    if (n == null || isNaN(n)) return '—';
+    return Number(n).toLocaleString('en-IN', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  }
+  function fmtCompact(n) {
+    if (n == null || isNaN(n)) return '0';
+    if (Math.abs(n) >= 10000000) return (n / 10000000).toFixed(1) + ' Cr';
+    if (Math.abs(n) >= 100000) return (n / 100000).toFixed(1) + ' L';
+    if (Math.abs(n) >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return Math.round(n).toString();
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function formatTime(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  function formatDate(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const days = Math.round((now - d) / (24 * 60 * 60 * 1000));
+    if (days === 0) return 'today';
+    if (days === 1) return 'yesterday';
+    if (days < 30) return `${days}d ago`;
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+  function toast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
+  document.querySelectorAll('.modal-overlay').forEach(o => {
+    o.addEventListener('click', e => { if (e.target === o) o.classList.remove('active'); });
+  });
+
+  // Boot: set up auth listener; data only loads after successful login
+  setupDropZone();
+  setupAuthListener();
+</script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1c232c;
+    --border: #2a323d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #d4ff3d;
+    --accent-dark: #a8cc2e;
+    --good: #3fb950;
+    --warn: #f0883e;
+    --bad: #f85149;
+    --info: #58a6ff;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: 'Geist', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  .app { max-width: 1400px; margin: 0 auto; padding: 28px 24px 80px; }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 28px; padding-bottom: 20px; border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 38px; height: 38px; background: var(--accent); border-radius: 8px;
+    display: grid; place-items: center;
+    font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
+    color: #0e1116; font-size: 20px;
+  }
+  .brand h1 {
+    font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700;
+    font-size: 22px; margin: 0; letter-spacing: -0.02em;
+  }
+  .brand .sub {
+    font-size: 11px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.1em;
+  }
+  .topbar-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .tabs {
+    display: flex; gap: 4px; margin-bottom: 24px;
+    background: var(--panel); padding: 4px; border-radius: 10px;
+    border: 1px solid var(--border); width: fit-content;
+    overflow-x: auto; max-width: 100%;
+  }
+  .tab {
+    padding: 9px 18px; border-radius: 7px; cursor: pointer;
+    font-size: 13px; font-weight: 500; color: var(--text-dim);
+    transition: all 0.15s; border: none; background: transparent;
+    font-family: inherit; white-space: nowrap;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--accent); color: #0e1116; font-weight: 600; }
+
+  .kpi-row {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 14px; margin-bottom: 22px;
+  }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 20px;
+  }
+  .kpi-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--text-dim); margin-bottom: 8px; font-weight: 500;
+  }
+  .kpi-value {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-size: 38px; font-weight: 700; line-height: 1; letter-spacing: -0.03em;
+  }
+  .kpi-meta {
+    font-size: 11px; color: var(--text-dim); margin-top: 6px;
+    font-family: 'Geist Mono', monospace;
+  }
+  .kpi.bad .kpi-value { color: var(--bad); }
+  .kpi.warn .kpi-value { color: var(--warn); }
+  .kpi.good .kpi-value { color: var(--good); }
+  .kpi.info .kpi-value { color: var(--accent); }
+
+  .filter-bar {
+    display: flex; gap: 10px; margin-bottom: 16px;
+    flex-wrap: wrap; align-items: center;
+  }
+  .filter-bar label { font-size: 12px; color: var(--text-dim); margin-right: 4px; }
+  .select, .input {
+    background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); padding: 9px 12px; border-radius: 8px;
+    font-size: 13px; font-family: inherit; outline: none;
+    transition: border-color 0.15s;
+  }
+  .select:focus, .input:focus { border-color: var(--accent); }
+  .input { min-width: 200px; }
+  .search-input { flex: 1; min-width: 200px; max-width: 280px; }
+
+  .btn {
+    background: var(--accent); color: #0e1116; border: none;
+    padding: 9px 16px; border-radius: 8px; font-weight: 600;
+    font-size: 13px; cursor: pointer; font-family: inherit;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: var(--accent-dark); }
+  .btn-ghost { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: var(--panel-2); border-color: var(--text-dim); }
+  .btn-danger { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+  .btn-danger:hover { background: var(--bad); color: white; }
+  .btn-sm { padding: 5px 10px; font-size: 11px; }
+  .btn-good { background: var(--good); color: white; }
+  .btn-good:hover { background: #2ea043; }
+
+  .table-wrap {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden; overflow-x: auto;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    background: var(--panel-2); text-align: left; padding: 12px 14px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  thead th.num, tbody td.num { text-align: right; font-family: 'Geist Mono', monospace; }
+  tbody td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(212, 255, 61, 0.04); }
+  .sku-tag {
+    font-family: 'Geist Mono', monospace; font-size: 11px;
+    background: var(--panel-2); padding: 2px 7px; border-radius: 4px;
+    color: var(--text-dim);
+  }
+  .size-tag, .color-tag {
+    display: inline-block; padding: 1px 6px; border-radius: 4px;
+    font-size: 10px; font-weight: 600;
+    background: rgba(88, 166, 255, 0.12); color: var(--info);
+    margin-right: 4px;
+  }
+  .color-tag { background: rgba(212, 255, 61, 0.12); color: var(--accent); }
+
+  .pill {
+    display: inline-block; padding: 3px 10px; border-radius: 100px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap;
+  }
+  .pill.outofstock { background: rgba(248, 81, 73, 0.15); color: var(--bad); }
+  .pill.reorder { background: rgba(240, 136, 62, 0.15); color: var(--warn); }
+  .pill.low { background: rgba(240, 200, 62, 0.15); color: #f0c83e; }
+  .pill.healthy { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+  .pill.overstock { background: rgba(88, 166, 255, 0.15); color: var(--info); }
+
+  .stock-bar-wrap { display: flex; align-items: center; gap: 8px; }
+  .stock-bar {
+    width: 64px; height: 6px; background: var(--panel-2);
+    border-radius: 100px; overflow: hidden;
+  }
+  .stock-bar-fill { height: 100%; border-radius: 100px; transition: width 0.3s; }
+
+  .empty { padding: 60px 20px; text-align: center; color: var(--text-dim); }
+  .empty-icon { font-size: 36px; margin-bottom: 12px; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px); display: none;
+    align-items: center; justify-content: center; z-index: 100;
+    padding: 20px;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 24px; width: 100%;
+    max-width: 580px; max-height: 90vh; overflow-y: auto;
+  }
+  .modal.wide { max-width: 760px; }
+  .modal h3 {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-size: 20px; font-weight: 700; margin: 0 0 16px; letter-spacing: -0.02em;
+  }
+  .form-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 12px; margin-bottom: 20px;
+  }
+  .form-grid .full { grid-column: 1 / -1; }
+  .field label {
+    display: block; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--text-dim);
+    margin-bottom: 5px; font-weight: 500;
+  }
+  .field input, .field select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 9px 11px; border-radius: 7px;
+    font-size: 13px; font-family: inherit; outline: none;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
+  .field-help {
+    font-size: 10.5px; color: var(--text-dim);
+    margin-top: 4px; line-height: 1.4;
+  }
+  .section-divider {
+    grid-column: 1 / -1;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-dim); margin-top: 8px; padding-top: 12px;
+    border-top: 1px dashed var(--border); font-weight: 600;
+  }
+
+  .toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); padding: 12px 18px;
+    border-radius: 8px; font-size: 13px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    transform: translateX(120%); transition: transform 0.3s;
+    z-index: 200;
+  }
+  .toast.show { transform: translateX(0); }
+
+  .reorder-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 14px;
+  }
+  .reorder-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; border-left: 3px solid var(--warn);
+  }
+  .reorder-card.outofstock { border-left-color: var(--bad); }
+  .reorder-card-head {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    margin-bottom: 14px; gap: 10px;
+  }
+  .reorder-card-name {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-size: 16px; font-weight: 700; letter-spacing: -0.01em;
+  }
+  .reorder-card-stats {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 10px; font-size: 12px;
+  }
+  .stat-block { background: var(--bg); padding: 10px; border-radius: 7px; }
+  .stat-label {
+    color: var(--text-dim); font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .stat-value {
+    font-family: 'Geist Mono', monospace; font-size: 16px;
+    margin-top: 2px; font-weight: 500;
+  }
+  .reorder-card-cta {
+    margin-top: 14px; padding: 10px; background: var(--accent);
+    color: #0e1116; border-radius: 7px; text-align: center;
+    font-weight: 600; font-size: 13px;
+  }
+  .supplier-line {
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px dashed var(--border);
+    font-size: 11px; color: var(--text-dim);
+  }
+
+  .group-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .group-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .group-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .group-card-name {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-size: 16px; font-weight: 700; margin-bottom: 8px;
+  }
+  .group-card-stats {
+    display: flex; gap: 14px; font-size: 11px;
+    color: var(--text-dim); flex-wrap: wrap;
+  }
+  .group-card-stat strong {
+    color: var(--text); font-family: 'Geist Mono', monospace;
+    font-size: 13px; font-weight: 500;
+  }
+  .group-card-flag {
+    margin-top: 10px; font-size: 11px;
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+
+  .setting-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px; margin-bottom: 14px;
+  }
+  .setting-card h3 {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    margin: 0 0 6px; font-size: 16px;
+  }
+  .setting-card p {
+    color: var(--text-dim); font-size: 13px;
+    margin: 0 0 16px; line-height: 1.5;
+  }
+
+  .activity-tag {
+    font-family: 'Geist Mono', monospace; font-size: 10px;
+    padding: 2px 6px; border-radius: 3px; font-weight: 600;
+  }
+  .activity-tag.in { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+  .activity-tag.out { background: rgba(248, 81, 73, 0.15); color: var(--bad); }
+
+  .breadcrumb {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--text-dim);
+    margin-bottom: 16px; flex-wrap: wrap;
+  }
+  .breadcrumb a {
+    color: var(--accent); cursor: pointer; text-decoration: none;
+  }
+  .breadcrumb a:hover { text-decoration: underline; }
+  .breadcrumb .sep { color: var(--border); }
+
+  /* Drop zone */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 32px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--bg);
+  }
+  .drop-zone:hover, .drop-zone.dragover {
+    border-color: var(--accent);
+    background: rgba(212, 255, 61, 0.04);
+  }
+  .drop-zone-icon {
+    font-size: 36px;
+    margin-bottom: 8px;
+  }
+  .drop-zone-title {
+    font-family: 'Bricolage Grotesque', sans-serif;
+    font-weight: 700; font-size: 16px;
+    margin-bottom: 4px;
+  }
+  .drop-zone-sub {
+    font-size: 12px; color: var(--text-dim);
+  }
+  input[type="file"] { display: none; }
+
+  /* Preview table */
+  .preview-summary {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin: 16px 0;
+  }
+  .preview-stat {
+    background: var(--bg);
+    padding: 12px;
+    border-radius: 8px;
+    border-left: 3px solid var(--accent);
+  }
+  .preview-stat.matched { border-left-color: var(--good); }
+  .preview-stat.unmatched { border-left-color: var(--bad); }
+  .preview-stat.duplicate { border-left-color: var(--warn); }
+  .preview-stat-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .preview-stat-value {
+    font-family: 'Geist Mono', monospace;
+    font-size: 22px; font-weight: 600;
+    margin-top: 4px;
+  }
+  .preview-table {
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+  }
+  .preview-table table { font-size: 12px; }
+  .preview-table thead th { background: var(--panel-2); }
+  .preview-row.bad { background: rgba(248, 81, 73, 0.08); }
+  .preview-row.bad td:first-child { border-left: 2px solid var(--bad); }
+  .row-status {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  .row-status.ok { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+  .row-status.err { background: rgba(248, 81, 73, 0.15); color: var(--bad); }
+
+  .upload-options {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin: 14px 0;
+  }
+  .upload-option-row {
+    display: flex; gap: 10px; align-items: center;
+    margin-bottom: 8px;
+  }
+  .upload-option-row:last-child { margin-bottom: 0; }
+  .upload-option-row label {
+    font-size: 12px; color: var(--text); cursor: pointer;
+  }
+
+  @media (max-width: 768px) {
+    .app { padding: 16px 12px 60px; }
+    .kpi-row { grid-template-columns: repeat(2, 1fr); }
+    .kpi-value { font-size: 28px; }
+    table { font-size: 12px; }
+    thead th, tbody td { padding: 8px 10px; }
+    .topbar { flex-direction: column; gap: 14px; align-items: flex-start; }
+    .tabs { width: 100%; }
+    .form-grid { grid-template-columns: 1fr; }
+    .preview-summary { grid-template-columns: 1fr; }
+  }
+
+  /* Read-only mode: hide all edit/delete inline buttons inside tables and cards */
+  body.readonly-mode .btn-danger,
+  body.readonly-mode .role-edit,
+  body.readonly-mode tbody .btn-ghost,
+  body.readonly-mode .reorder-card-cta,
+  body.readonly-mode .setting-card .btn-danger,
+  body.readonly-mode #manage-users-section {
+    display: none !important;
+  }
+  body.readonly-mode .filter-bar .btn-good {
+    display: none !important;
+  }
+  body.readonly-mode #user-info {
+    border: 1px solid var(--text-dim);
+  }
+</style>
+
+<!-- ============== LOGIN SCREEN ============== -->
+<div id="login-screen" style="position:fixed; inset:0; background: linear-gradient(135deg, #0e1116 0%, #1c232c 100%); z-index: 9999; display: none; align-items: center; justify-content: center; padding: 20px; font-family: 'Geist', sans-serif;">
+  <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 40px 32px; max-width: 420px; width: 100%; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+    <div style="text-align:center;">
+      <div style="width: 70px; height: 70px; background: var(--accent); border-radius: 14px; margin: 0 auto 22px; display: grid; place-items: center; font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: #0e1116; font-size: 32px;">RG</div>
+      <h1 style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.02em;">Retail Garments IMS</h1>
+      <p style="color: var(--text-dim); font-size: 13px; margin: 0 0 28px;">Username aur password se sign in karo</p>
+    </div>
+
+    <div class="field" style="margin-bottom: 14px;">
+      <label>Username</label>
+      <input type="text" id="login-username" placeholder="admin" autocomplete="username" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 11px 13px; border-radius: 8px; font-size: 14px; font-family: inherit; outline: none;" />
+    </div>
+
+    <div class="field" style="margin-bottom: 18px;">
+      <label>Password</label>
+      <input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 11px 13px; border-radius: 8px; font-size: 14px; font-family: inherit; outline: none;" onkeydown="if(event.key==='Enter') signInWithUsername()" />
+    </div>
+
+    <button id="login-btn" onclick="signInWithUsername()" style="width: 100%; background: var(--accent); color: #0e1116; border: none; padding: 12px 20px; border-radius: 10px; font-weight: 700; font-size: 14px; cursor: pointer; font-family: inherit; transition: all 0.15s;">
+      Sign In
+    </button>
+
+    <div id="login-error" style="display:none; margin-top: 16px; padding: 10px 12px; background: rgba(248,81,73,0.1); border: 1px solid var(--bad); border-radius: 8px; color: var(--bad); font-size: 12px;"></div>
+
+    <div style="margin-top: 24px; padding: 12px; background: var(--bg); border-radius: 8px; font-size: 11px; color: var(--text-dim); line-height: 1.6;">
+      <strong style="color: var(--text);">First-time login (default):</strong><br>
+      👑 <code style="color: var(--accent);">admin</code> / <code>admin123</code> — full access<br>
+      📊 <code style="color: var(--info);">manager</code> / <code>manager123</code> — upload + edit<br>
+      👁️ <code style="color: var(--text-dim);">staff1</code> / <code>staff123</code> — read-only<br>
+      <br>
+      ⚠️ <strong>Login ke baad turant Settings mein passwords change karo!</strong>
+    </div>
+  </div>
+</div>
+
+<div class="app">
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-mark">RG</div>
+      <div>
+        <h1>Retail Garments IMS</h1>
+        <div class="sub">Supplier · Brand · SKU <span id="cloud-status" style="margin-left:8px; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; background: rgba(63,185,80,0.15); color: var(--good);">☁ Cloud Connected</span></div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <div id="user-info" style="display:flex; align-items:center; gap:8px; padding: 6px 12px; background: var(--panel-2); border-radius: 8px; font-size: 12px;">
+        <span id="user-email" style="color: var(--text-dim);"></span>
+        <span id="user-role-badge" style="padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;"></span>
+      </div>
+      <button class="btn btn-ghost" onclick="signOut()" title="Sign out">🚪 Logout</button>
+      <button class="btn btn-ghost" onclick="refreshFromCloud()" title="Cloud se latest data laao">🔄 Refresh</button>
+      <button class="btn btn-ghost role-edit" onclick="openSupplierModal()">+ Supplier</button>
+      <button class="btn btn-ghost role-edit" onclick="openBrandModal()">+ Brand</button>
+      <button class="btn btn-good role-edit" onclick="openUploadModal('In', 'voucher')">📥 Purchase Voucher</button>
+      <button class="btn btn-good role-edit" onclick="openUploadModal('In', 'challan')" style="background: #5cbb39;">📥 Purchase Challan</button>
+      <button class="btn btn-danger role-edit" onclick="openUploadModal('Out', 'sale')">📤 Upload Sale</button>
+      <button class="btn role-edit" onclick="openItemModal()">+ Add SKU</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="livestock" onclick="switchTab('livestock')">Live Stock</button>
+    <button class="tab" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tab" data-tab="suppliers" onclick="switchTab('suppliers')">Suppliers</button>
+    <button class="tab" data-tab="brands" onclick="switchTab('brands')">Brands</button>
+    <button class="tab" data-tab="inventory" onclick="switchTab('inventory')">All SKUs</button>
+    <button class="tab" data-tab="fastmovers" onclick="switchTab('fastmovers')">⚡ Fast Movers</button>
+    <button class="tab" data-tab="reorder" onclick="switchTab('reorder')">Reorder List</button>
+    <button class="tab" data-tab="activity" onclick="switchTab('activity')">Activity</button>
+    <button class="tab" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+  </div>
+
+  <!-- LIVE STOCK (focused, default tab) -->
+  <div id="tab-livestock" class="tab-content">
+    <div class="filter-bar">
+      <label>Supplier:</label>
+      <select id="ls-supplier" class="select" onchange="onLiveStockSupplierChange()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <label>Brand:</label>
+      <select id="ls-brand" class="select" onchange="renderLiveStock()">
+        <option value="all">All Brands</option>
+      </select>
+      <label>Show:</label>
+      <select id="ls-status" class="select" onchange="renderLiveStock()">
+        <option value="all">All Items</option>
+        <option value="instock">In Stock Only</option>
+        <option value="lowstock">Low / Out of Stock</option>
+      </select>
+      <input id="ls-search" class="input search-input" type="text" placeholder="Search name, SKU, size, color..." oninput="renderLiveStock()" />
+      <span style="margin-left:auto; color: var(--text-dim); font-size:12px" id="ls-count"></span>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th>Brand</th>
+            <th class="num">Stock (pcs)</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="ls-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-dashboard" class="tab-content" style="display:none">
+    <div class="kpi-row">
+      <div class="kpi info">
+        <div class="kpi-label">Total SKUs</div>
+        <div class="kpi-value" id="kpi-total">—</div>
+        <div class="kpi-meta" id="kpi-total-meta"></div>
+      </div>
+      <div class="kpi bad">
+        <div class="kpi-label">Out of Stock</div>
+        <div class="kpi-value" id="kpi-out">—</div>
+        <div class="kpi-meta">need urgent action</div>
+      </div>
+      <div class="kpi warn">
+        <div class="kpi-label">Need Reorder</div>
+        <div class="kpi-value" id="kpi-reorder">—</div>
+        <div class="kpi-meta">below reorder point</div>
+      </div>
+      <div class="kpi good">
+        <div class="kpi-label">Stock Value</div>
+        <div class="kpi-value" id="kpi-value">—</div>
+        <div class="kpi-meta" id="kpi-value-meta">at cost price</div>
+      </div>
+    </div>
+
+    <div class="filter-bar">
+      <label>Supplier:</label>
+      <select id="dash-supplier" class="select" onchange="onDashSupplierChange()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <label>Brand:</label>
+      <select id="dash-brand" class="select" onchange="renderDashboard()">
+        <option value="all">All Brands</option>
+      </select>
+      <input id="dash-search" class="input search-input" type="text" placeholder="Search name, SKU, size, color..." oninput="renderDashboard()" />
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>SKU / Item</th>
+            <th>Brand</th>
+            <th>Supplier</th>
+            <th class="num">Stock</th>
+            <th class="num">Reorder Pt</th>
+            <th class="num">Days Cover</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="dash-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-suppliers" class="tab-content" style="display:none">
+    <div id="supplier-view"></div>
+  </div>
+
+  <div id="tab-brands" class="tab-content" style="display:none">
+    <div id="brand-view"></div>
+  </div>
+
+  <div id="tab-inventory" class="tab-content" style="display:none">
+    <div class="filter-bar">
+      <label>Supplier:</label>
+      <select id="inv-supplier" class="select" onchange="onInvSupplierChange()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <label>Brand:</label>
+      <select id="inv-brand" class="select" onchange="renderInventory()">
+        <option value="all">All Brands</option>
+      </select>
+      <input id="inv-search" class="input search-input" type="text" placeholder="Search..." oninput="renderInventory()" />
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>SKU / Item</th>
+            <th>Brand</th>
+            <th>Supplier</th>
+            <th class="num">Cost</th>
+            <th class="num">Sell</th>
+            <th class="num">Daily</th>
+            <th class="num">LT</th>
+            <th class="num">SF</th>
+            <th class="num">MOQ</th>
+            <th class="num">Stock</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="inv-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-reorder" class="tab-content" style="display:none">
+    <div class="filter-bar">
+      <label>Supplier:</label>
+      <select id="reorder-supplier" class="select" onchange="onReorderSupplierChange()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <label>Brand:</label>
+      <select id="reorder-brand" class="select" onchange="renderReorder()">
+        <option value="all">All Brands</option>
+      </select>
+      <button class="btn btn-good btn-sm" onclick="downloadReorderXLSX('regular')" style="margin-left:auto">↓ Download Excel</button>
+      <span style="color: var(--text-dim); font-size:12px" id="reorder-count"></span>
+    </div>
+    <div style="font-size:12px; color: var(--text-dim); margin-bottom:14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; border-left: 3px solid var(--warn);">
+      <strong>Reorder List:</strong> items that are out of stock or below their reorder point. Out-of-stock items always show here (urgent). Fast-moving items with healthy stock show in the Fast Movers tab instead.
+    </div>
+    <div id="reorder-content"></div>
+  </div>
+
+  <div id="tab-fastmovers" class="tab-content" style="display:none">
+    <div class="filter-bar">
+      <label>Supplier:</label>
+      <select id="fm-supplier" class="select" onchange="onFastMoverSupplierChange()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <label>Brand:</label>
+      <select id="fm-brand" class="select" onchange="renderFastMovers()">
+        <option value="all">All Brands</option>
+      </select>
+      <button class="btn btn-good btn-sm" onclick="downloadReorderXLSX('fastmover')" style="margin-left:auto">↓ Download Excel</button>
+      <span style="color: var(--text-dim); font-size:12px" id="fm-count"></span>
+    </div>
+    <div style="font-size:12px; color: var(--text-dim); margin-bottom:14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; border-left: 3px solid var(--accent);" id="fm-explainer">
+      <strong>⚡ Fast movers:</strong> items where the velocity threshold has been hit on the last batch.
+    </div>
+    <div id="fm-content"></div>
+  </div>
+
+  <div id="tab-activity" class="tab-content" style="display:none">
+    <div class="filter-bar">
+      <label>Supplier:</label>
+      <select id="act-supplier" class="select" onchange="onActSupplierChange()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <label>Brand:</label>
+      <select id="act-brand" class="select" onchange="renderActivity()">
+        <option value="all">All Brands</option>
+      </select>
+      <input id="act-search" class="input search-input" type="text" placeholder="Search..." oninput="renderActivity()" />
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>SKU / Item</th>
+            <th>Brand</th>
+            <th>Type</th>
+            <th class="num">Qty</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="act-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-settings" class="tab-content" style="display:none">
+    <div class="setting-card">
+      <h3>📊 Excel upload format</h3>
+      <p>
+        Both Purchase (Stock IN) and Sales (Stock OUT) sheets use the same format. The first row should be column headers; the rest are your transactions.
+      </p>
+      <p style="font-size:12px;">
+        <strong>Required columns:</strong> <code>SKU Code</code> and <code>Quantity</code>.<br>
+        <strong>Optional columns:</strong> <code>Date</code>, <code>Note</code> (bill no, customer name, etc).<br>
+        Column order doesn't matter — match by name. SKU codes that don't exist in the system will be skipped (you'll see them in the preview).
+      </p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top: 8px;">
+        <button class="btn btn-ghost" onclick="downloadTemplate('In')">↓ Purchase Template (.csv)</button>
+        <button class="btn btn-ghost" onclick="downloadTemplate('Out')">↓ Sale Template (.csv)</button>
+        <button class="btn btn-ghost" onclick="downloadSKUList()">↓ Current SKU Codes (.csv)</button>
+      </div>
+    </div>
+
+    <div class="setting-card">
+      <h3>⚡ Reorder Trigger — Sales Velocity</h3>
+      <p>
+        A SKU is flagged for reorder when <strong>X% or more of a received batch sells within Y days</strong>.
+        This catches fast-moving items before they run out — even when current stock looks fine.
+      </p>
+      <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; max-width:600px; margin-top:8px;">
+        <div class="field">
+          <label>Window (days)</label>
+          <input type="number" id="set-vd" step="1" min="1" />
+          <div class="field-help">Look-back period after each purchase</div>
+        </div>
+        <div class="field">
+          <label>Threshold (%)</label>
+          <input type="number" id="set-vp" step="1" min="1" max="100" />
+          <div class="field-help">Min % sold to trigger reorder</div>
+        </div>
+        <div class="field">
+          <label>Fast Mover Multiplier (×)</label>
+          <input type="number" id="set-rm" step="0.5" min="1" />
+          <div class="field-help">Fast movers get reordered at this × the last batch size (e.g. 2 = double)</div>
+        </div>
+      </div>
+      <div style="margin-top:14px;">
+        <button class="btn" onclick="saveVelocitySettings()">Save Settings</button>
+      </div>
+      <p style="font-size:11px; color: var(--text-dim); margin-top:14px;">
+        <strong>Current rule (20 days / 75% / 2× boost):</strong> Received 4 pcs, sold 3 within 20 days → flagged as fast mover.
+        Next order will be 4 × 2 = <strong>8 pcs</strong>. Slow-moving items still order at normal refill quantity.
+      </p>
+    </div>
+
+    <div class="setting-card">
+      <h3>How reorder works</h3>
+      <p>
+        A SKU appears on the <strong>Reorder List</strong> if any of these are true:<br>
+        1. <strong>Out of stock</strong> (current stock ≤ 0)<br>
+        2. <strong>Sales velocity trigger</strong> — fast sell-through on the latest batch (settings above)<br>
+        3. <strong>Below reorder point</strong> — stock ≤ Daily Sales × Lead Time × Safety Factor (uses supplier's LT and SF)
+      </p>
+      <p style="font-size:12px;">
+        <strong>Suggested Order Qty:</strong><br>
+        • Normal items: max(MOQ, Max Level − Current Stock)<br>
+        • Fast movers (velocity-triggered): last batch × multiplier (e.g. received 4 pcs → order 8)<br>
+        <strong>Lead Time and Safety Factor</strong> are set per <strong>Supplier</strong> (one place, applies to all SKUs from that supplier).
+      </p>
+    </div>
+
+    <div class="setting-card" id="manage-users-section" style="border-left: 3px solid var(--accent);">
+      <h3>👥 Manage Users (Admin Only)</h3>
+      <p>
+        Logon ko 3 roles mein add kar sakte ho:<br>
+        <strong>👑 Admin</strong> — full access (sab kuch kar sakte hain)<br>
+        <strong>📊 Manager</strong> — upload aur add/edit kar sakte hain, delete nahi<br>
+        <strong>👁️ Staff</strong> — sirf view (read-only)
+      </p>
+
+      <div style="background: var(--bg); border-radius: 8px; padding: 14px; margin-top: 14px;">
+        <div style="font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; margin-bottom: 10px;">Current Users:</div>
+        <div id="users-list" style="display: flex; flex-direction: column; gap: 6px;"></div>
+      </div>
+
+      <div style="margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--border);">
+        <div style="font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; margin-bottom: 10px;">Add New User:</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr 130px auto; gap: 8px; align-items: flex-end;">
+          <div class="field">
+            <label>Username</label>
+            <input type="text" id="new-user-email" placeholder="staff3" style="width: 100%;" />
+          </div>
+          <div class="field">
+            <label>Password</label>
+            <input type="text" id="new-user-password" placeholder="atleast 4 chars" style="width: 100%;" />
+          </div>
+          <div class="field">
+            <label>Role</label>
+            <select id="new-user-role" class="select" style="width: 100%;">
+              <option value="manager">Manager</option>
+              <option value="staff" selected>Staff</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+          <button class="btn" onclick="addUserAccess()">Add</button>
+        </div>
+      </div>
+
+      <p style="font-size: 11px; color: var(--text-dim); margin-top: 14px; line-height: 1.5;">
+        💡 <strong>Tip:</strong> Username mein sirf lowercase, numbers aur underscore (_) chal sakte hain. Spaces ya special chars nahi.<br>
+        🔑 Password change karne ke liye user ke saamne wala 🔑 button click karo.<br>
+        ⚠️ <strong>Default passwords abhi simple hain (admin123 etc.) — pehle inhe change karo!</strong>
+      </p>
+    </div>
+
+    <div class="setting-card" style="border-left: 3px solid var(--good);">
+      <h3>💾 Backup & Restore (FREE Cloud Storage via Google Drive)</h3>
+      <p>
+        Apna saara data ek file mein download karo. Phir us file ko apne <strong>Google Drive</strong>, <strong>email ko self-send</strong>, ya <strong>WhatsApp self-chat</strong> mein save kar do — kahi se bhi access kar sakte ho.
+      </p>
+      <p style="font-size: 12px; color: var(--text-dim); line-height: 1.6;">
+        <strong>Backup karne ke 3 free tarike:</strong><br>
+        1️⃣ <strong>Google Drive:</strong> drive.google.com kholo → "+ New" → File upload → backup file daalo<br>
+        2️⃣ <strong>Email:</strong> apne aap ko email karo, attachment mein backup file lagao<br>
+        3️⃣ <strong>WhatsApp:</strong> apne aap ko message karo, file attach karo<br>
+        <br>
+        <strong>Restore kaise karo:</strong> Naya computer ya phone? Bas backup file download karo, "Restore from Backup" button pe upload karo. Saara data wapas aa jayega.
+      </p>
+      <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px;">
+        <button class="btn btn-good" onclick="downloadBackup()">↓ Download Backup</button>
+        <input type="file" id="restore-file" accept=".json" style="display:none" onchange="handleRestoreFile(event)" />
+        <button class="btn btn-ghost" onclick="document.getElementById('restore-file').click()">↑ Restore from Backup</button>
+      </div>
+      <p style="font-size: 11px; color: var(--text-dim); margin-top: 14px;">
+        💡 <strong>Tip:</strong> Hafte mein ek baar backup le lo (Sunday raat ko, 30 second ka kaam). Agar computer crash ho jaye, browser data clear ho jaye, ya phone change karo — restore button se sab wapas.
+      </p>
+    </div>
+
+    <div class="setting-card">
+      <h3>Sample data</h3>
+      <p>Loaded with 2 suppliers, 4 brands, and 12 sample SKUs across sizes & colors.</p>
+      <button class="btn btn-ghost" onclick="loadSampleData()">Reset to sample data</button>
+    </div>
+
+    <div class="setting-card">
+      <h3>Danger zone</h3>
+      <p>Wipes everything. Cannot be undone.</p>
+      <button class="btn btn-danger" onclick="if(confirm('Delete everything? This cannot be undone.')) wipeData()">Delete all data</button>
+    </div>
+  </div>
+</div>
+
+<!-- ITEM MODAL -->
+<div class="modal-overlay" id="item-modal">
+  <div class="modal">
+    <h3 id="item-modal-title">Add SKU</h3>
+    <div class="form-grid">
+      <div class="field full">
+        <label>Item Name</label>
+        <input type="text" id="m-name" placeholder="e.g. Slim Fit Jeans" />
+      </div>
+      <div class="field">
+        <label>Brand</label>
+        <select id="m-brand"></select>
+      </div>
+      <div class="field">
+        <label>Category (optional)</label>
+        <input type="text" id="m-category" placeholder="Jeans, Shirts, etc." />
+      </div>
+      <div class="field">
+        <label>Size</label>
+        <input type="text" id="m-size" placeholder="S, M, L, 32, 34..." />
+      </div>
+      <div class="field">
+        <label>Color</label>
+        <input type="text" id="m-color" placeholder="Blue, Black..." />
+      </div>
+      <div class="field">
+        <label>Cost Price (₹)</label>
+        <input type="number" id="m-cost" step="1" placeholder="800" />
+      </div>
+      <div class="field">
+        <label>Selling Price (₹)</label>
+        <input type="number" id="m-sell" step="1" placeholder="1499" />
+      </div>
+      <div class="section-divider">Reorder Settings</div>
+      <div class="field">
+        <label>Avg Daily Sales (optional)</label>
+        <input type="number" id="m-adc" step="0.1" placeholder="2" />
+        <div class="field-help">Used for "Days of Cover" display only</div>
+      </div>
+      <div class="field">
+        <label>MOQ</label>
+        <input type="number" id="m-moq" step="1" placeholder="12" />
+      </div>
+      <div class="field">
+        <label>Max Level</label>
+        <input type="number" id="m-max" step="1" placeholder="50" />
+      </div>
+      <div class="field">
+        <label>Starting Stock</label>
+        <input type="number" id="m-stock" step="1" placeholder="0" />
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('item-modal')">Cancel</button>
+      <button class="btn" onclick="saveItem()">Save SKU</button>
+    </div>
+  </div>
+</div>
+
+<!-- SUPPLIER MODAL -->
+<div class="modal-overlay" id="supplier-modal">
+  <div class="modal">
+    <h3 id="supplier-modal-title">Add Supplier</h3>
+    <div class="form-grid">
+      <div class="field full">
+        <label>Supplier Name</label>
+        <input type="text" id="s-name" placeholder="ABC Wholesale" />
+      </div>
+      <div class="field">
+        <label>Contact Person</label>
+        <input type="text" id="s-contact" placeholder="Mr. Sharma" />
+      </div>
+      <div class="field">
+        <label>Phone</label>
+        <input type="text" id="s-phone" placeholder="+91 ..." />
+      </div>
+      <div class="field full">
+        <label>Notes (location, payment terms, etc.)</label>
+        <input type="text" id="s-notes" placeholder="Surat · Net 30" />
+      </div>
+      <div class="section-divider">Reorder Parameters</div>
+      <div class="field">
+        <label>Lead Time (days)</label>
+        <input type="number" id="s-lt" step="1" placeholder="14" />
+        <div class="field-help">Days from order to delivery for this supplier</div>
+      </div>
+      <div class="field">
+        <label>Safety Factor</label>
+        <input type="number" id="s-sf" step="0.1" placeholder="1.5" />
+        <div class="field-help">1.2 reliable · 1.5 standard · 2.0 unpredictable</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('supplier-modal')">Cancel</button>
+      <button class="btn" onclick="saveSupplier()">Save Supplier</button>
+    </div>
+  </div>
+</div>
+
+<!-- BRAND MODAL -->
+<div class="modal-overlay" id="brand-modal">
+  <div class="modal">
+    <h3 id="brand-modal-title">Add Brand</h3>
+    <div class="form-grid">
+      <div class="field full">
+        <label>Brand Name</label>
+        <input type="text" id="b-name" placeholder="Levi's" />
+      </div>
+      <div class="field full">
+        <label>Supplier</label>
+        <select id="b-supplier"></select>
+        <div class="field-help">Lead Time and Safety Factor come from this supplier</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal('brand-modal')">Cancel</button>
+      <button class="btn" onclick="saveBrand()">Save Brand</button>
+    </div>
+  </div>
+</div>
+
+<!-- UPLOAD MODAL -->
+<div class="modal-overlay" id="upload-modal">
+  <div class="modal wide">
+    <h3 id="upload-modal-title">Upload Purchase Sheet</h3>
+    <p style="color: var(--text-dim); font-size: 13px; margin-top: -8px; margin-bottom: 14px;" id="upload-modal-sub">
+      Each row will be added as Stock IN. Required columns: <strong>SKU Code</strong>, <strong>Quantity</strong>.
+    </p>
+
+    <div id="upload-step-1">
+      <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <div class="drop-zone-icon">📄</div>
+        <div class="drop-zone-title">Drop Excel/CSV file here, or click to browse</div>
+        <div class="drop-zone-sub">.xlsx, .xls, .csv accepted</div>
+      </div>
+      <input type="file" id="file-input" accept=".xlsx,.xls,.csv" onchange="handleFileSelect(event)" />
+      <div class="modal-actions" style="margin-top: 16px;">
+        <button class="btn btn-ghost" onclick="downloadCurrentTemplate()">↓ Download template</button>
+        <button class="btn btn-ghost" onclick="closeModal('upload-modal')">Cancel</button>
+      </div>
+    </div>
+
+    <div id="upload-step-2" style="display:none">
+      <div id="preview-summary-wrap"></div>
+      <div class="upload-options" id="upload-options-wrap"></div>
+      <div class="preview-table" id="preview-table-wrap"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="resetUpload()">← Back</button>
+        <button class="btn btn-ghost" onclick="closeModal('upload-modal')">Cancel</button>
+        <button class="btn" id="confirm-upload-btn" onclick="confirmUpload()">Confirm Import</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- SheetJS for Excel parsing -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<!-- Firebase SDK (compat version for plain HTML) -->
+<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore-compat.js"></script>
+
+<script>
+  // ============== FIREBASE CONFIG ==============
+  // This config is from your Firebase Console. The apiKey is safe to expose
+  // in client-side code — security is enforced by Firestore Rules.
+  const firebaseConfig = {
+    apiKey: "AIzaSyBaIxmZk8rmBlsbdZpcFM0ipWejwiu40E8",
+    authDomain: "garments-ims.firebaseapp.com",
+    projectId: "garments-ims",
+    storageBucket: "garments-ims.firebasestorage.app",
+    messagingSenderId: "326625610840",
+    appId: "1:326625610840:web:a9f36656fb0fd8b1f5ce2d"
+  };
+
+  // Initialize Firebase
+  let firebaseApp, db;
+  try {
+    firebaseApp = firebase.initializeApp(firebaseConfig);
+    db = firebase.firestore();
+    console.log('✓ Firebase initialized');
+  } catch (err) {
+    console.error('Firebase init failed:', err);
+    alert('Firebase connect nahi ho paya. Internet check karo aur page reload karo.');
+  }
+
+  // ============== ROLES & AUTH CONFIG ==============
+  // Default users — first-time setup. After login, Admin can change passwords / add users in Settings.
+  const DEFAULT_USERS = {
+    'admin':    { password: 'admin123',    role: 'admin',   isOwner: true },
+    'manager':  { password: 'manager123',  role: 'manager', isOwner: false },
+    'staff1':   { password: 'staff123',    role: 'staff',   isOwner: false },
+    'staff2':   { password: 'staff456',    role: 'staff',   isOwner: false }
+  };
+
+  // Roles:
+  //   admin   — full access. The 'admin' user is owner and cannot be deleted.
+  //   manager — can upload/add/edit, but NOT delete or change settings
+  //   staff   — read-only
+
+  // Current session state
+  let currentUser = null;        // username after login
+  let currentUserRole = null;    // 'admin' | 'manager' | 'staff' | null
+
+  function getUsersTable() {
+    // settings.users is the source of truth; if missing, fall back to defaults.
+    if (!settings.users || Object.keys(settings.users).length === 0) {
+      settings.users = JSON.parse(JSON.stringify(DEFAULT_USERS));
+    }
+    return settings.users;
+  }
+
+  function isAdmin() { return currentUserRole === 'admin'; }
+  function isManager() { return currentUserRole === 'manager'; }
+  function isStaff() { return currentUserRole === 'staff'; }
+  function canEdit() { return isAdmin() || isManager(); }
+  function canDelete() { return isAdmin(); }
+  function canManageUsers() { return isAdmin(); }
+
+  // Path structure for Firestore: /shops/{SHOP_DOC}/...
+  const SHOP_DOC = 'mainshop';
+</script>
+
+<script>
+  // STATE
+  let suppliers = [];
+  let brands = [];
+  let items = [];
+  let transactions = [];
+  let settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+  let editingId = null;
+  let currentSupplierFocus = null;
+  let currentBrandFocus = null;
+
+  // Upload state
+  let uploadType = 'In';      // 'In' | 'Out'
+  let uploadFormat = 'voucher'; // 'voucher' | 'challan' | 'sale'
+  let parsedRows = [];
+  let pendingNewSuppliers = [];
+  let pendingNewBrands = [];
+  let pendingNewSkus = [];
+
+  // STORAGE — Firebase Firestore (cloud, accessible from anywhere)
+  // Falls back to local cache while Firebase loads.
+  // Path structure: /shops/{SHOP_DOC}/{collection}/{docId}
+  // For simplicity: store entire suppliers/brands/items/transactions arrays in single docs.
+
+  let isOnline = false;
+  let saveQueue = Promise.resolve(); // serialize saves to avoid race conditions
+
+  async function loadData() {
+    if (!db) {
+      alert('Firebase ready nahi hai. Page reload karo.');
+      return;
+    }
+    showLoadingOverlay('Loading data from cloud...');
+    try {
+      const shopRef = db.collection('shops').doc(SHOP_DOC);
+      const snapshot = await shopRef.get();
+
+      if (snapshot.exists) {
+        const data = snapshot.data();
+        suppliers = data.suppliers || [];
+        brands = data.brands || [];
+        items = data.items || [];
+        transactions = data.transactions || [];
+        if (data.settings) settings = { ...settings, ...data.settings };
+        isOnline = true;
+        bumpDataVersion();
+        console.log(`✓ Loaded from Firebase: ${suppliers.length} suppliers, ${brands.length} brands, ${items.length} SKUs, ${transactions.length} transactions`);
+      } else {
+        // First-time use — create empty document
+        console.log('No data in Firebase yet, creating empty shop document');
+        await shopRef.set({
+          suppliers: [], brands: [], items: [], transactions: [], settings,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        isOnline = true;
+        // Load sample data for first-time users
+        await loadSampleData(false);
+      }
+    } catch (err) {
+      console.error('Firebase load failed:', err);
+      alert('Cloud se data load nahi hua. Reasons:\n\n1. Internet nahi hai\n2. Firestore Database create nahi kiya\n3. Rules "if true" set nahi kiye\n\nFirebase Console mein check karo.');
+      isOnline = false;
+    } finally {
+      hideLoadingOverlay();
+      renderAll();
+    }
+  }
+
+  let lastSaveOk = true;
+
+  async function saveAll() {
+    if (!db || !isOnline) {
+      console.warn('Firebase offline — save skipped');
+      toast('⚠️ Offline — changes saved nahi hue. Internet connect karo.');
+      lastSaveOk = false;
+      return;
+    }
+    bumpDataVersion(); // invalidate stock cache
+    // Queue saves so concurrent updates don't race
+    saveQueue = saveQueue.then(async () => {
+      try {
+        const shopRef = db.collection('shops').doc(SHOP_DOC);
+        await shopRef.set({
+          suppliers,
+          brands,
+          items,
+          transactions,
+          settings,
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        console.log('✓ Saved to Firebase');
+        lastSaveOk = true;
+      } catch (err) {
+        console.error('Firebase save failed:', err);
+        lastSaveOk = false;
+        if (err.message && err.message.includes('exceeds the maximum')) {
+          toast('⚠️ Data zyada hai (1MB limit) — kuch purana data delete karo');
+        } else if (err.code === 'permission-denied') {
+          toast('⚠️ Permission denied — Firestore rules check karo');
+        } else {
+          toast('⚠️ Cloud save fail ho gaya — internet check karo');
+        }
+      }
+    });
+    return saveQueue;
+  }
+
+  // Loading overlay shown during initial Firebase load
+  function showLoadingOverlay(msg) {
+    let overlay = document.getElementById('fb-loading-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'fb-loading-overlay';
+      overlay.style.cssText = 'position:fixed; inset:0; background:rgba(14,17,22,0.95); display:flex; align-items:center; justify-content:center; z-index:1000; flex-direction:column; gap:14px; font-family: Geist, sans-serif;';
+      overlay.innerHTML = `
+        <div style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; color: var(--accent); font-weight:700;">☁️ ${msg}</div>
+        <div style="color: var(--text-dim); font-size: 13px;">Cloud se sync ho raha hai...</div>
+      `;
+      document.body.appendChild(overlay);
+    }
+  }
+  function hideLoadingOverlay() {
+    const overlay = document.getElementById('fb-loading-overlay');
+    if (overlay) overlay.remove();
+  }
+
+  // ============== USER ACCESS MANAGEMENT (Admin only) ==============
+  function renderUsersList() {
+    const container = document.getElementById('users-list');
+    if (!container) return;
+    const users = getUsersTable();
+    const entries = Object.entries(users);
+
+    if (entries.length === 0) {
+      container.innerHTML = '<div style="color: var(--text-dim); font-size: 12px;">No users yet.</div>';
+      return;
+    }
+
+    const roleColors = {
+      admin:   { bg: 'rgba(212,255,61,0.15)',   color: 'var(--accent)' },
+      manager: { bg: 'rgba(88,166,255,0.15)',   color: 'var(--info)' },
+      staff:   { bg: 'rgba(139,148,158,0.15)',  color: 'var(--text-dim)' }
+    };
+
+    container.innerHTML = entries.map(([username, info]) => {
+      const role = info.role;
+      const isOwner = info.isOwner === true;
+      const isYou = username === currentUser;
+      const c = roleColors[role] || roleColors.staff;
+      return `
+        <div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--panel-2); border-radius: 6px; font-size: 12px;">
+          <div style="flex: 1;">
+            <div style="font-family: 'Geist Mono', monospace; font-weight: 600; font-size: 13px;">
+              ${escapeHtml(username)}
+              ${isOwner ? '<span style="color: var(--text-dim); font-style: italic; margin-left: 6px; font-weight: normal;">(owner)</span>' : ''}
+              ${isYou && !isOwner ? '<span style="color: var(--text-dim); font-style: italic; margin-left: 6px; font-weight: normal;">(you)</span>' : ''}
+            </div>
+            <div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">Password: <span style="font-family: 'Geist Mono', monospace;">${'•'.repeat(Math.min(info.password.length, 12))}</span></div>
+          </div>
+          <span style="padding: 3px 9px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; background: ${c.bg}; color: ${c.color};">${role}</span>
+          <button class="btn btn-ghost btn-sm" onclick="changeUserPassword('${escapeJs(username)}')" title="Change password">🔑</button>
+          ${isOwner ? '' : `<button class="btn btn-danger btn-sm" onclick="removeUserAccess('${escapeJs(username)}')" title="Remove user">×</button>`}
+        </div>
+      `;
+    }).join('');
+  }
+
+  function escapeJs(s) {
+    return String(s).replace(/['"\\]/g, '\\$&');
+  }
+
+  async function addUserAccess() {
+    if (!canManageUsers()) {
+      alert('Sirf Admin user add kar sakte hain.');
+      return;
+    }
+    const usernameInput = document.getElementById('new-user-email');
+    const passwordInput = document.getElementById('new-user-password');
+    const roleSelect = document.getElementById('new-user-role');
+    const username = (usernameInput.value || '').trim().toLowerCase();
+    const password = (passwordInput ? passwordInput.value : '') || '';
+    const role = roleSelect.value;
+
+    if (!username) {
+      alert('Username daalo');
+      return;
+    }
+    if (!/^[a-z0-9_]+$/.test(username)) {
+      alert('Username mein sirf lowercase letters, numbers, aur _ chal sakte hain (no spaces, no special chars)');
+      return;
+    }
+    if (!password || password.length < 4) {
+      alert('Password kam se kam 4 characters ka hona chahiye');
+      return;
+    }
+
+    const users = getUsersTable();
+    if (users[username]) {
+      if (!confirm(`Username "${username}" pehle se hai. Password aur role update karna hai?`)) return;
+    }
+
+    users[username] = { password, role, isOwner: false };
+    await saveAll();
+    renderUsersList();
+    usernameInput.value = '';
+    if (passwordInput) passwordInput.value = '';
+    toast(`✓ ${username} (${role}) add ho gaya`);
+  }
+
+  async function removeUserAccess(username) {
+    if (!canManageUsers()) {
+      alert('Sirf Admin remove kar sakte hain.');
+      return;
+    }
+    const users = getUsersTable();
+    const info = users[username];
+    if (!info) return;
+    if (info.isOwner) {
+      alert('Owner ko remove nahi kar sakte.');
+      return;
+    }
+    if (username === currentUser) {
+      alert('Apne aap ko remove nahi kar sakte. Pehle kisi aur Admin se karwao.');
+      return;
+    }
+    if (!confirm(`${username} ka access remove karna hai? Ye user ab login nahi kar payega.`)) return;
+    delete users[username];
+    await saveAll();
+    renderUsersList();
+    toast(`✓ ${username} remove ho gaya`);
+  }
+
+  async function changeUserPassword(username) {
+    if (!canManageUsers() && username !== currentUser) {
+      alert('Sirf Admin doosron ka password change kar sakte hain.');
+      return;
+    }
+    const users = getUsersTable();
+    const info = users[username];
+    if (!info) return;
+    const newPwd = prompt(`${username} ka naya password daalo:`, '');
+    if (newPwd === null) return;
+    if (!newPwd || newPwd.length < 4) {
+      alert('Password kam se kam 4 characters ka hona chahiye');
+      return;
+    }
+    info.password = newPwd;
+    await saveAll();
+    renderUsersList();
+    toast(`✓ ${username} ka password change ho gaya`);
+  }
+
+  // ============== AUTHENTICATION (Username + Password) ==============
+  function showLoginScreen(errorMsg) {
+    document.getElementById('login-screen').style.display = 'flex';
+    document.querySelector('.app').style.display = 'none';
+    const errEl = document.getElementById('login-error');
+    if (errorMsg) {
+      errEl.style.display = 'block';
+      errEl.textContent = errorMsg;
+    } else {
+      errEl.style.display = 'none';
+    }
+    // Focus username field
+    setTimeout(() => {
+      const u = document.getElementById('login-username');
+      if (u) u.focus();
+    }, 100);
+  }
+
+  function hideLoginScreen() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.querySelector('.app').style.display = '';
+  }
+
+  async function signInWithUsername() {
+    const usernameInput = document.getElementById('login-username');
+    const passwordInput = document.getElementById('login-password');
+    const btn = document.getElementById('login-btn');
+    const errEl = document.getElementById('login-error');
+
+    const username = (usernameInput.value || '').trim().toLowerCase();
+    const password = passwordInput.value || '';
+
+    if (!username || !password) {
+      errEl.style.display = 'block';
+      errEl.textContent = 'Username aur password dono daalo';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+    btn.textContent = 'Signing in...';
+
+    try {
+      // Load data first to get the latest users table
+      await loadData();
+
+      const users = getUsersTable();
+      const userInfo = users[username];
+
+      if (!userInfo) {
+        throw new Error('Username galat hai');
+      }
+      if (userInfo.password !== password) {
+        throw new Error('Password galat hai');
+      }
+
+      // Login successful
+      currentUser = username;
+      currentUserRole = userInfo.role;
+
+      // Save session in browser so refresh doesn't kick out
+      try {
+        sessionStorage.setItem('rg_session_user', username);
+      } catch {}
+
+      hideLoginScreen();
+      updateUserUI();
+      applyRolePermissions();
+      renderAll();
+      passwordInput.value = '';
+      toast(`✓ Welcome, ${username}!`);
+    } catch (err) {
+      console.error('Sign-in failed:', err);
+      errEl.style.display = 'block';
+      errEl.textContent = err.message || 'Login failed';
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.textContent = 'Sign In';
+    }
+  }
+
+  function signOut() {
+    if (!confirm('Logout karna hai?')) return;
+    currentUser = null;
+    currentUserRole = null;
+    try { sessionStorage.removeItem('rg_session_user'); } catch {}
+    location.reload();
+  }
+
+  // Boot: check if there's a saved session, otherwise show login
+  async function setupAuthListener() {
+    let savedUser = null;
+    try { savedUser = sessionStorage.getItem('rg_session_user'); } catch {}
+
+    if (!savedUser) {
+      showLoginScreen();
+      return;
+    }
+
+    // Auto-login from session
+    showLoadingOverlay('Restoring session...');
+    try {
+      await loadData();
+      const users = getUsersTable();
+      const userInfo = users[savedUser];
+      if (!userInfo) {
+        // User was removed from system
+        try { sessionStorage.removeItem('rg_session_user'); } catch {}
+        hideLoadingOverlay();
+        showLoginScreen('Aapka access remove ho gaya. Dobara login karo.');
+        return;
+      }
+      currentUser = savedUser;
+      currentUserRole = userInfo.role;
+      hideLoadingOverlay();
+      hideLoginScreen();
+      updateUserUI();
+      applyRolePermissions();
+      renderAll();
+    } catch (err) {
+      hideLoadingOverlay();
+      console.error('Session restore failed:', err);
+      showLoginScreen('Connection error. Dobara login karo.');
+    }
+  }
+
+  function updateUserUI() {
+    const emailEl = document.getElementById('user-email');
+    const badgeEl = document.getElementById('user-role-badge');
+    if (emailEl && currentUser) {
+      emailEl.textContent = currentUser;
+    }
+    if (badgeEl && currentUserRole) {
+      badgeEl.textContent = currentUserRole;
+      const colors = {
+        admin:   { bg: 'rgba(212,255,61,0.2)',   color: 'var(--accent)' },
+        manager: { bg: 'rgba(88,166,255,0.2)',   color: 'var(--info)' },
+        staff:   { bg: 'rgba(139,148,158,0.2)',  color: 'var(--text-dim)' }
+      };
+      const c = colors[currentUserRole] || colors.staff;
+      badgeEl.style.background = c.bg;
+      badgeEl.style.color = c.color;
+    }
+  }
+
+  function applyRolePermissions() {
+    const editAllowed = canEdit();
+
+    document.querySelectorAll('.role-edit').forEach(el => {
+      el.style.display = editAllowed ? '' : 'none';
+    });
+
+    if (!editAllowed) {
+      document.body.classList.add('readonly-mode');
+    } else {
+      document.body.classList.remove('readonly-mode');
+    }
+  }
+
+  // Manual refresh — re-fetch latest data from Firebase
+  async function refreshFromCloud() {
+    if (!db) {
+      toast('⚠️ Firebase ready nahi hai');
+      return;
+    }
+    showLoadingOverlay('Refreshing from cloud...');
+    try {
+      const shopRef = db.collection('shops').doc(SHOP_DOC);
+      const snapshot = await shopRef.get();
+      if (snapshot.exists) {
+        const data = snapshot.data();
+        suppliers = data.suppliers || [];
+        brands = data.brands || [];
+        items = data.items || [];
+        transactions = data.transactions || [];
+        if (data.settings) settings = { ...settings, ...data.settings };
+        bumpDataVersion();
+        // Re-check role since users list might have changed
+        if (currentUser) {
+          const users = getUsersTable();
+          const userInfo = users[currentUser];
+          if (!userInfo) {
+            // Current user was removed
+            try { sessionStorage.removeItem('rg_session_user'); } catch {}
+            location.reload();
+            return;
+          }
+          currentUserRole = userInfo.role;
+        }
+        applyRolePermissions();
+        renderAll();
+        toast('✓ Latest data load ho gaya');
+      }
+    } catch (err) {
+      console.error('Refresh failed:', err);
+      toast('⚠️ Refresh fail ho gaya — internet check karo');
+    } finally {
+      hideLoadingOverlay();
+    }
+  }
+
+  async function loadSampleData(showMsg = true) {
+    suppliers = [
+      { id: 's1', name: 'ABC Wholesale', contact: 'Mr. Sharma', phone: '+91 98xxxxxx01', notes: 'Surat · Net 30',  lt: 14, sf: 1.5 },
+      { id: 's2', name: 'Star Apparels', contact: 'Mrs. Iyer',  phone: '+91 98xxxxxx02', notes: 'Tirupur · COD',  lt: 10, sf: 1.7 }
+    ];
+    brands = [
+      { id: 'b1', name: "Levi's",         supplierId: 's1' },
+      { id: 'b2', name: 'Peter England',  supplierId: 's1' },
+      { id: 'b3', name: 'Allen Solly',    supplierId: 's2' },
+      { id: 'b4', name: 'Roadster',       supplierId: 's2' }
+    ];
+    items = [
+      { id: 'LV-SLM-32-IND', name: 'Slim Fit Jeans',     brandId: 'b1', category: 'Jeans',    size: '32', color: 'Indigo Blue', cost: 1200, sell: 2499, adc: 0.5, moq: 12, max: 40, startStock: 0 },
+      { id: 'LV-SLM-34-IND', name: 'Slim Fit Jeans',     brandId: 'b1', category: 'Jeans',    size: '34', color: 'Indigo Blue', cost: 1200, sell: 2499, adc: 0.7, moq: 12, max: 40, startStock: 0 },
+      { id: 'LV-SLM-36-BLK', name: 'Slim Fit Jeans',     brandId: 'b1', category: 'Jeans',    size: '36', color: 'Black',       cost: 1200, sell: 2499, adc: 0.3, moq: 12, max: 30, startStock: 0 },
+      { id: 'PE-CTN-M-WHT',  name: 'Cotton Shirt',       brandId: 'b2', category: 'Shirts',   size: 'M',  color: 'White',       cost: 600,  sell: 1299, adc: 0.8, moq: 24, max: 60, startStock: 0 },
+      { id: 'PE-CTN-L-WHT',  name: 'Cotton Shirt',       brandId: 'b2', category: 'Shirts',   size: 'L',  color: 'White',       cost: 600,  sell: 1299, adc: 1.0, moq: 24, max: 60, startStock: 0 },
+      { id: 'PE-CTN-L-SKY',  name: 'Cotton Shirt',       brandId: 'b2', category: 'Shirts',   size: 'L',  color: 'Sky Blue',    cost: 600,  sell: 1299, adc: 0.6, moq: 24, max: 50, startStock: 0 },
+      { id: 'AS-LIN-32-BEI', name: 'Linen Trousers',     brandId: 'b3', category: 'Trousers', size: '32', color: 'Beige',       cost: 900,  sell: 1899, adc: 0.3, moq: 18, max: 30, startStock: 0 },
+      { id: 'AS-POL-M-NVY',  name: 'Polo T-Shirt',       brandId: 'b3', category: 'T-Shirts', size: 'M',  color: 'Navy',        cost: 350,  sell: 799,  adc: 1.5, moq: 36, max: 100, startStock: 0 },
+      { id: 'AS-POL-L-NVY',  name: 'Polo T-Shirt',       brandId: 'b3', category: 'T-Shirts', size: 'L',  color: 'Navy',        cost: 350,  sell: 799,  adc: 2.0, moq: 36, max: 120, startStock: 0 },
+      { id: 'RD-CRG-32-OLV', name: 'Cargo Pants',        brandId: 'b4', category: 'Pants',    size: '32', color: 'Olive',       cost: 750,  sell: 1599, adc: 0.5, moq: 24, max: 40, startStock: 0 },
+      { id: 'RD-HSW-L-GRY',  name: 'Hooded Sweatshirt',  brandId: 'b4', category: 'Winter',   size: 'L',  color: 'Grey',        cost: 850,  sell: 1799, adc: 0.6, moq: 18, max: 45, startStock: 0 }
+    ];
+
+    // Build sample transactions to demo velocity logic.
+    // Day offsets are RELATIVE to today.
+    const now = Date.now();
+    const D = 24 * 60 * 60 * 1000;
+    const tx = (itemId, type, qty, daysAgo, note) => ({
+      id: 't' + Math.random().toString(36).slice(2, 10),
+      itemId, type, qty, note: note || '',
+      ts: now - daysAgo * D
+    });
+
+    transactions = [
+      // SKU LV-SLM-32-IND received 4, sold 2 within 30 days → SHOULD trigger reorder (50%)
+      tx('LV-SLM-32-IND', 'In',  4, 25, 'Bill 1001'),
+      tx('LV-SLM-32-IND', 'Out', 1, 18, 'Customer'),
+      tx('LV-SLM-32-IND', 'Out', 1, 5,  'Customer'),
+
+      // SKU LV-SLM-34-IND received 6, sold 4 within 30 days → SHOULD trigger (66%)
+      tx('LV-SLM-34-IND', 'In',  6, 22, 'Bill 1001'),
+      tx('LV-SLM-34-IND', 'Out', 2, 18, 'Customer'),
+      tx('LV-SLM-34-IND', 'Out', 2, 8,  'Customer'),
+
+      // SKU LV-SLM-36-BLK received 4, sold 1 within 30 days → SHOULD NOT trigger (25%)
+      tx('LV-SLM-36-BLK', 'In',  4, 20, 'Bill 1001'),
+      tx('LV-SLM-36-BLK', 'Out', 1, 10, 'Customer'),
+
+      // Cotton Shirt M White: stable, healthy
+      tx('PE-CTN-M-WHT',  'In',  24, 28, 'Bill 1002'),
+      tx('PE-CTN-M-WHT',  'Out', 4,  20, 'Customer'),
+      tx('PE-CTN-M-WHT',  'Out', 3,  12, 'Customer'),
+
+      // Cotton Shirt L White: fast mover (received 24, sold 14 = 58%)
+      tx('PE-CTN-L-WHT',  'In',  24, 26, 'Bill 1002'),
+      tx('PE-CTN-L-WHT',  'Out', 6,  20, 'Customer'),
+      tx('PE-CTN-L-WHT',  'Out', 5,  15, 'Customer'),
+      tx('PE-CTN-L-WHT',  'Out', 3,  6,  'Customer'),
+
+      // Cotton Shirt L Sky Blue: out of stock (received 18, sold 18)
+      tx('PE-CTN-L-SKY',  'In',  18, 24, 'Bill 1002'),
+      tx('PE-CTN-L-SKY',  'Out', 18, 14, 'Cleared out'),
+
+      // Polo M Navy: hot (received 36, sold 22 = 61%)
+      tx('AS-POL-M-NVY',  'In',  36, 27, 'Bill 1003'),
+      tx('AS-POL-M-NVY',  'Out', 10, 20, 'Customer'),
+      tx('AS-POL-M-NVY',  'Out', 7,  10, 'Customer'),
+      tx('AS-POL-M-NVY',  'Out', 5,  3,  'Customer'),
+
+      // Polo L Navy: extremely hot (received 36, sold 28 = 78%)
+      tx('AS-POL-L-NVY',  'In',  36, 27, 'Bill 1003'),
+      tx('AS-POL-L-NVY',  'Out', 12, 20, 'Customer'),
+      tx('AS-POL-L-NVY',  'Out', 10, 10, 'Customer'),
+      tx('AS-POL-L-NVY',  'Out', 6,  3,  'Customer'),
+
+      // Linen Trousers: slow (received 18, sold 3 = 17%)
+      tx('AS-LIN-32-BEI', 'In',  18, 28, 'Bill 1003'),
+      tx('AS-LIN-32-BEI', 'Out', 2,  18, 'Customer'),
+      tx('AS-LIN-32-BEI', 'Out', 1,  5,  'Customer'),
+
+      // Cargo Pants: slow
+      tx('RD-CRG-32-OLV', 'In',  24, 25, 'Bill 1004'),
+      tx('RD-CRG-32-OLV', 'Out', 3,  10, 'Customer'),
+
+      // Hoodie: stable
+      tx('RD-HSW-L-GRY',  'In',  18, 30, 'Bill 1004'),
+      tx('RD-HSW-L-GRY',  'Out', 4,  18, 'Customer'),
+      tx('RD-HSW-L-GRY',  'Out', 3,  8,  'Customer')
+    ];
+
+    settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+    await saveAll();
+    renderAll();
+    if (showMsg) toast('Sample data loaded');
+  }
+
+  async function wipeData() {
+    suppliers = []; brands = []; items = []; transactions = [];
+    settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+    await saveAll();
+    renderAll();
+    toast('All data deleted');
+  }
+
+  // ============== BACKUP & RESTORE ==============
+  function downloadBackup() {
+    const backup = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      appName: 'Retail Garments IMS',
+      data: {
+        suppliers,
+        brands,
+        items,
+        transactions,
+        settings
+      }
+    };
+    const json = JSON.stringify(backup, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const today = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `garments_ims_backup_${today}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    const stats = `${suppliers.length} suppliers · ${brands.length} brands · ${items.length} SKUs · ${transactions.length} transactions`;
+    toast(`✓ Backup downloaded (${stats})`);
+  }
+
+  function handleRestoreFile(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const backup = JSON.parse(e.target.result);
+        if (!backup || !backup.data) {
+          alert('Galat backup file. Ye is app ka backup nahi lagta.');
+          event.target.value = '';
+          return;
+        }
+        const d = backup.data;
+        const stats = `${(d.suppliers||[]).length} suppliers, ${(d.brands||[]).length} brands, ${(d.items||[]).length} SKUs, ${(d.transactions||[]).length} transactions`;
+        const confirmMsg = `Backup mein hai: ${stats}\n\nKya aap apna saara abhi ka data REPLACE karna chahte ho is backup se?\n\n⚠️ Abhi ka data hat jayega. Confirm karne se pehle abhi ka backup le lo agar zaruri hai.`;
+        if (!confirm(confirmMsg)) {
+          event.target.value = '';
+          return;
+        }
+        suppliers = d.suppliers || [];
+        brands = d.brands || [];
+        items = d.items || [];
+        transactions = d.transactions || [];
+        settings = d.settings || { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+        await saveAll();
+        renderAll();
+        toast(`✓ Restore complete — ${stats}`);
+      } catch (err) {
+        console.error(err);
+        alert('Backup file padh nahi paaye. File corrupt ho sakti hai ya format galat hai.');
+      }
+      event.target.value = ''; // Reset so same file can be picked again
+    };
+    reader.onerror = () => alert('File padhne mein error.');
+    reader.readAsText(file);
+  }
+
+  // ============== EXCEL UPLOAD ==============
+  function openUploadModal(type, format) {
+    uploadType = type;
+    uploadFormat = format || (type === 'In' ? 'voucher' : 'sale');
+    parsedRows = [];
+    pendingNewSuppliers = [];
+    pendingNewBrands = [];
+    pendingNewSkus = [];
+
+    let title, sub;
+    if (uploadFormat === 'voucher') {
+      title = '📥 Upload Purchase Voucher (Stock IN)';
+      sub = `Each row will be added as <strong>Stock IN</strong>. New suppliers, brands, and SKUs will be auto-created. <strong>SKU code = Lot Number + Size</strong>.<br>Expected columns: <code>Party Name, Company Name, Item Name, Shade, Pack/Size, <strong>Lot Number</strong>, Total Quantity, Voucher Date, Rate</code>.`;
+    } else if (uploadFormat === 'challan') {
+      title = '📥 Upload Purchase Challan (Stock IN)';
+      sub = `Each row will be added as <strong>Stock IN</strong>. New suppliers and SKUs will be auto-created. <strong>SKU code = Lot No. + Pack/Grade</strong>.<br>Expected columns: <code>Ch Date, Ch No., Party Name, Item Name, Pack/Grade, <strong>Lot No.</strong>, Total Qty</code>.`;
+    } else {
+      title = '📤 Upload Sale Report (Stock OUT)';
+      sub = `Each row will be added as <strong>Stock OUT</strong>. SKU must already exist (uploaded via Purchase Voucher or Challan first).<br>Expected columns: <code>Bill Date, Company Name, Category, Pack/Size, Item Name, Sale Qty, Shade, <strong>Lot Number</strong></code>.`;
+    }
+
+    document.getElementById('upload-modal-title').textContent = title;
+    document.getElementById('upload-modal-sub').innerHTML = sub;
+    document.getElementById('upload-step-1').style.display = 'block';
+    document.getElementById('upload-step-2').style.display = 'none';
+    document.getElementById('file-input').value = '';
+    document.getElementById('upload-modal').classList.add('active');
+  }
+
+  function resetUpload() {
+    document.getElementById('upload-step-1').style.display = 'block';
+    document.getElementById('upload-step-2').style.display = 'none';
+    document.getElementById('file-input').value = '';
+    parsedRows = [];
+    pendingNewSuppliers = [];
+    pendingNewBrands = [];
+    pendingNewSkus = [];
+  }
+
+  function handleFileSelect(e) {
+    const file = e.target.files[0];
+    if (file) parseFile(file);
+  }
+
+  // Drag & drop
+  function setupDropZone() {
+    const dz = document.getElementById('drop-zone');
+    if (!dz) return;
+    ['dragenter','dragover'].forEach(ev =>
+      dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('dragover'); }));
+    ['dragleave','drop'].forEach(ev =>
+      dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('dragover'); }));
+    dz.addEventListener('drop', e => {
+      const f = e.dataTransfer.files[0];
+      if (f) parseFile(f);
+    });
+  }
+
+  function parseFile(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb = XLSX.read(data, { type: 'array', cellDates: true });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        // Read raw 2D array — we need to find the header row ourselves
+        const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+        if (aoa.length === 0) {
+          alert('The sheet appears to be empty.');
+          return;
+        }
+        // Find the header row: the first row that contains at least 3 of these keywords
+        const keywords = ['sku','item','quantity','qty','party','supplier','company','brand','shade','size','pack','rate','date'];
+        let headerRowIdx = 0;
+        for (let i = 0; i < Math.min(aoa.length, 15); i++) {
+          const row = aoa[i].map(c => String(c || '').toLowerCase());
+          let hits = 0;
+          for (const k of keywords) {
+            if (row.some(c => c.includes(k))) hits++;
+          }
+          if (hits >= 3) { headerRowIdx = i; break; }
+        }
+        const headers = aoa[headerRowIdx].map(h => String(h || '').trim());
+
+        // ============== FILE TYPE VALIDATION ==============
+        // Detect if user uploaded the WRONG file type via the wrong button.
+        // Each format has unique columns that prove its type.
+        const headerSetLower = headers.map(h => h.toLowerCase().replace(/[\s_/.-]/g, ''));
+        const hasCol = (name) => headerSetLower.includes(name);
+
+        // Detect actual file type from headers
+        let detectedFormat = null;
+        if (hasCol('saleqty') || hasCol('agentname')) {
+          detectedFormat = 'sale';
+        } else if (hasCol('chdate') || hasCol('chno') || hasCol('packgrade')) {
+          detectedFormat = 'challan';
+        } else if (hasCol('voucherdate') || hasCol('netamount') || hasCol('rateunit') || hasCol('grossamount')) {
+          detectedFormat = 'voucher';
+        }
+
+        // Compare detected vs expected (uploadFormat is set when user clicked the button)
+        const formatNames = {
+          voucher: 'Purchase Voucher',
+          challan: 'Purchase Challan',
+          sale: 'Sale Report'
+        };
+
+        if (detectedFormat && detectedFormat !== uploadFormat) {
+          const expected = formatNames[uploadFormat];
+          const actual = formatNames[detectedFormat];
+          alert(`❌ GALAT FILE!\n\n` +
+                `Aapne "${expected}" button click kiya hai,\n` +
+                `Lekin file hai: "${actual}"\n\n` +
+                `Ye file accept NAHI hogi.\n\n` +
+                `Sahi tarika:\n` +
+                `• Purchase Voucher button → sirf purchase voucher file\n` +
+                `• Purchase Challan button → sirf purchase challan file\n` +
+                `• Upload Sale button → sirf sale report file\n\n` +
+                `Sahi button click karke dobara try karo.`);
+          return; // Strict reject - no continue option
+        }
+
+        // Also reject if file format CAN'T be detected at all (random/unknown file)
+        if (!detectedFormat) {
+          const expected = formatNames[uploadFormat];
+          alert(`❌ FILE PEHCHANI NAHI GAYI!\n\n` +
+                `Ye file "${expected}" jaise nahi dikhti.\n\n` +
+                `Expected columns missing hain:\n` +
+                (uploadFormat === 'voucher' ? '• VOUCHER DATE / NET AMOUNT / RATE/UNIT / GROSS AMOUNT\n' : '') +
+                (uploadFormat === 'challan' ? '• CH DATE / CH NO. / PACK/GRADE\n' : '') +
+                (uploadFormat === 'sale' ? '• SALE QTY / AGENT NAME\n' : '') +
+                `\nSahi format ki file upload karo.`);
+          return;
+        }
+        // ============== END VALIDATION ==============
+
+        const dataRows = aoa.slice(headerRowIdx + 1).map(arr => {
+          const obj = {};
+          headers.forEach((h, j) => { if (h) obj[h] = arr[j]; });
+          return obj;
+        }).filter(r => Object.values(r).some(v => v !== '' && v != null));
+
+        if (dataRows.length === 0) {
+          alert('No data rows found below the header row.');
+          return;
+        }
+        processRows(dataRows, headerRowIdx);
+      } catch (err) {
+        console.error(err);
+        alert('Could not read this file. Make sure it is a valid .xlsx, .xls, or .csv file.');
+      }
+    };
+    reader.onerror = () => alert('Error reading file.');
+    reader.readAsArrayBuffer(file);
+  }
+
+  // Build a deterministic SKU code from Lot Number + Size.
+  // We deliberately ignore Lot Code (the user asked us to).
+  // Format: LOTNUM-SIZE (uppercase, alphanumeric only, hyphen-separated)
+  function makeSkuCode(lotNumber, size) {
+    const slug = (s, len) => String(s || '').toUpperCase()
+      .replace(/[^A-Z0-9]/g, '')
+      .slice(0, len) || 'X';
+    const lot = slug(lotNumber, 14);
+    const sz = slug(size, 6);
+    return `${lot}-${sz}`;
+  }
+
+  function processRows(rows, headerRowIdx) {
+    // Snapshot what new entities would be created (don't mutate yet)
+    const newSuppliers = new Map(); // name → {id, name}
+    const newBrands = new Map();    // name → {id, name, supplierId}
+    const newSkus = new Map();      // skuCode → item draft
+
+    parsedRows = rows.map((row, idx) => {
+      const norm = {};
+      Object.keys(row).forEach(k => {
+        norm[k.toLowerCase().replace(/[\s_/.-]/g, '')] = row[k];
+      });
+
+      // Direct SKU code (if file has one) — preferred
+      let skuCode = String(norm.skucode || norm.sku || norm.code || norm.itemcode || '').trim();
+
+      // Fields from billing software exports — column names matched flexibly.
+      // Supports all 3 formats: Purchase Voucher, Purchase Challan, Sale Report.
+      const partyName = String(norm.partyname || norm.party || norm.supplier || norm.suppliername || norm.agentname || '').trim();
+      const companyName = String(norm.companyname || norm.company || norm.brand || norm.brandname || '').trim();
+      const groupName = String(norm.groupname || norm.group || norm.category || '').trim();
+      const itemName = String(norm.itemname || norm.item || norm.product || norm.productname || '').trim();
+      const shade = String(norm.shadename || norm.shade || norm.colour || norm.color || '').trim();
+      // Pack/Size: Voucher uses "Pack/Size", Challan uses "Pack/Grade"
+      const size = String(norm.packsize || norm.packgrade || norm.pack || norm.size || norm.grade || '').trim();
+      // Lot identifier: Voucher "Lot Number", Challan "Lot No.", both → lotnumber/lotno after normalization
+      const lotNumber = String(norm.lotnumber || norm.lotno || norm.lot || '').trim();
+      const rate = parseFloat(String(norm.rateunit || norm.rate || norm.cost || norm.price || norm.netamount || norm.grossamount || '').replace(/,/g, '')) || 0;
+
+      // Quantity: Voucher "Total Quantity", Challan "Total Qty", Sale "Sale Qty"
+      const qtyRaw = norm.totalquantity ?? norm.totalqty ?? norm.saleqty ?? norm.quantity ?? norm.qty ?? norm.units ?? norm.pieces ?? norm.pcs ?? '';
+      const qty = parseFloat(String(qtyRaw).replace(/,/g, ''));
+
+      // Date: Voucher "Voucher Date", Challan "Ch Date", Sale "Bill Date"
+      // Date priority: BILL DATE pehle (asli maal aane ki date), phir Ch Date (challan), phir Voucher Date (software entry).
+      // Bill Date sabse important hai velocity/reorder calculation ke liye kyunki ye actual receipt date hai.
+      const date = norm.billdate || norm.chdate || norm.voucherdate || norm.date || '';
+
+      // Note/Reference: Voucher "Bill No.", Challan "Ch No."
+      const note = String(norm.note || norm.remarks || norm.billno || norm.chno || norm.invoice || norm.customer || '').trim();
+
+      // SKU code priority:
+      // 1) Direct SKU Code column if present
+      // 2) Auto-generated from Lot Number + Size
+      let derivedFromColumns = false;
+      if (!skuCode && lotNumber) {
+        skuCode = makeSkuCode(lotNumber, size);
+        derivedFromColumns = true;
+      }
+
+      let valid = true;
+      let reason = '';
+      let action = ''; // 'add_existing' | 'create_new'
+
+      if (!skuCode) {
+        valid = false; reason = 'Missing SKU/item identification';
+      } else if (isNaN(qty) || qty <= 0) {
+        valid = false; reason = 'Invalid quantity';
+      }
+
+      // Try to match an existing SKU
+      let item = null;
+      if (skuCode) {
+        item = items.find(i => i.id.toLowerCase() === skuCode.toLowerCase());
+      }
+
+      if (valid) {
+        if (item) {
+          action = 'add_existing';
+        } else if (uploadType === 'In' && derivedFromColumns) {
+          // Purchase upload + we have brand/item info → auto-create the SKU on import
+          action = 'create_new';
+
+          // Track the supplier we'll create (if needed)
+          let supplierId = null;
+          if (partyName) {
+            const existing = suppliers.find(s => s.name.toLowerCase() === partyName.toLowerCase());
+            if (existing) {
+              supplierId = existing.id;
+            } else if (newSuppliers.has(partyName.toLowerCase())) {
+              supplierId = newSuppliers.get(partyName.toLowerCase()).id;
+            } else {
+              const id = 's' + (Date.now() + newSuppliers.size).toString(36);
+              newSuppliers.set(partyName.toLowerCase(), { id, name: partyName });
+              supplierId = id;
+            }
+          }
+
+          // Track the brand we'll create (if needed)
+          const brandName = companyName || partyName || 'Unknown';
+          let brandId = null;
+          const brandKey = brandName.toLowerCase();
+          const existingBrand = brands.find(b => b.name.toLowerCase() === brandKey);
+          if (existingBrand) {
+            brandId = existingBrand.id;
+          } else if (newBrands.has(brandKey)) {
+            brandId = newBrands.get(brandKey).id;
+          } else {
+            const id = 'b' + (Date.now() + newBrands.size + 10000).toString(36);
+            newBrands.set(brandKey, { id, name: brandName, supplierId });
+            brandId = id;
+          }
+
+          // Track the SKU draft (if not already in the Map)
+          if (!newSkus.has(skuCode)) {
+            newSkus.set(skuCode, {
+              id: skuCode,
+              name: itemName || 'Unnamed',
+              brandId,
+              category: groupName,
+              size,
+              color: shade,
+              cost: rate,
+              sell: 0,
+              adc: 0,
+              moq: 0,
+              max: 0,
+              startStock: 0
+            });
+          }
+        } else if (uploadType === 'Out') {
+          // Sales for an SKU we don't have — skip
+          valid = false;
+          reason = 'SKU not found (sales need existing SKUs)';
+        } else {
+          valid = false;
+          reason = 'Cannot identify item — need a Lot Number column or SKU Code';
+        }
+      }
+
+      return {
+        rowNum: idx + headerRowIdx + 2,
+        sku: skuCode,
+        qty: isNaN(qty) ? 0 : qty,
+        date,
+        note,
+        item,
+        valid,
+        reason,
+        action,
+        // For preview display
+        derivedInfo: derivedFromColumns ? {
+          supplier: partyName,
+          brand: companyName,
+          item: itemName,
+          shade,
+          size
+        } : null
+      };
+    });
+
+    // Save the planned creations so confirmUpload can apply them
+    pendingNewSuppliers = Array.from(newSuppliers.values());
+    pendingNewBrands = Array.from(newBrands.values());
+    pendingNewSkus = Array.from(newSkus.values());
+
+    showPreview();
+  }
+
+  function showPreview() {
+    document.getElementById('upload-step-1').style.display = 'none';
+    document.getElementById('upload-step-2').style.display = 'block';
+
+    const total = parsedRows.length;
+    const valid = parsedRows.filter(r => r.valid).length;
+    const invalid = total - valid;
+    const totalQty = parsedRows.filter(r => r.valid).reduce((s, r) => s + r.qty, 0);
+
+    const newSupCount = pendingNewSuppliers.length;
+    const newBrCount = pendingNewBrands.length;
+    const newSkuCount = pendingNewSkus.length;
+    const hasNewEntities = newSupCount + newBrCount + newSkuCount > 0;
+
+    document.getElementById('preview-summary-wrap').innerHTML = `
+      <div class="preview-summary">
+        <div class="preview-stat matched">
+          <div class="preview-stat-label">Will Import</div>
+          <div class="preview-stat-value">${valid}</div>
+        </div>
+        <div class="preview-stat unmatched">
+          <div class="preview-stat-label">Will Skip</div>
+          <div class="preview-stat-value">${invalid}</div>
+        </div>
+        <div class="preview-stat">
+          <div class="preview-stat-label">Total ${uploadType === 'In' ? 'Receiving' : 'Selling'}</div>
+          <div class="preview-stat-value">${fmt(totalQty)}</div>
+        </div>
+      </div>
+      ${hasNewEntities ? `
+        <div style="background: var(--panel-2); border: 1px solid var(--accent); border-radius: 8px; padding: 12px 14px; margin-top: 10px; font-size: 12px;">
+          <strong style="color: var(--accent);">New entities to be created:</strong>
+          <div style="margin-top: 6px; color: var(--text);">
+            ${newSupCount > 0 ? `<strong>${newSupCount}</strong> supplier${newSupCount===1?'':'s'} · ` : ''}
+            ${newBrCount > 0 ? `<strong>${newBrCount}</strong> brand${newBrCount===1?'':'s'} · ` : ''}
+            ${newSkuCount > 0 ? `<strong>${newSkuCount}</strong> SKU${newSkuCount===1?'':'s'}` : ''}
+          </div>
+          <div style="margin-top: 4px; color: var(--text-dim); font-size: 11px;">
+            You can edit any of these later (set Lead Time / Safety Factor on suppliers, MOQ / Max Level on SKUs, etc.)
+          </div>
+        </div>
+      ` : ''}
+    `;
+
+    document.getElementById('upload-options-wrap').innerHTML = invalid > 0 ? `
+      <div style="font-size: 12px; color: var(--text-dim);">
+        <strong>${invalid}</strong> row${invalid===1?'':'s'} will be skipped. Valid rows still import.
+      </div>
+    ` : `
+      <div style="font-size: 12px; color: var(--good);">
+        ✓ All rows look good. Click "Confirm Import" to proceed.
+      </div>
+    `;
+
+    // Show first 200 rows in the preview table
+    document.getElementById('preview-table-wrap').innerHTML = `
+      <table>
+        <thead>
+          <tr>
+            <th style="width:40px">Row</th>
+            <th>SKU / Item</th>
+            <th class="num">Qty</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${parsedRows.slice(0, 200).map(r => {
+            const itemDisplay = r.item
+              ? `${escapeHtml(r.item.name)}${r.item.size ? ' · '+escapeHtml(r.item.size) : ''}${r.item.color ? ' · '+escapeHtml(r.item.color) : ''}`
+              : (r.derivedInfo
+                  ? `${escapeHtml(r.derivedInfo.brand || r.derivedInfo.supplier || '')}${r.derivedInfo.item ? ' · '+escapeHtml(r.derivedInfo.item) : ''}${r.derivedInfo.shade ? ' · '+escapeHtml(r.derivedInfo.shade) : ''}${r.derivedInfo.size ? ' · '+escapeHtml(r.derivedInfo.size) : ''}`
+                  : '<span style="color:var(--text-dim)">—</span>');
+            let statusBadge;
+            if (!r.valid) {
+              statusBadge = `<span class="row-status err" title="${escapeHtml(r.reason)}">Skip — ${escapeHtml(r.reason)}</span>`;
+            } else if (r.action === 'create_new') {
+              statusBadge = `<span class="row-status" style="background: rgba(212,255,61,0.15); color: var(--accent);">Create + Import</span>`;
+            } else {
+              statusBadge = `<span class="row-status ok">Will import</span>`;
+            }
+            return `
+              <tr class="preview-row ${r.valid ? '' : 'bad'}">
+                <td style="color:var(--text-dim); font-family:'Geist Mono',monospace; font-size:11px;">${r.rowNum}</td>
+                <td>
+                  <div>${itemDisplay}</div>
+                  <div style="font-size:10px; color:var(--text-dim); margin-top:2px;"><span class="sku-tag">${escapeHtml(r.sku || '—')}</span></div>
+                </td>
+                <td class="num">${fmt(r.qty)}</td>
+                <td>${statusBadge}</td>
+              </tr>
+            `;
+          }).join('')}
+          ${parsedRows.length > 200 ? `<tr><td colspan="4" style="text-align:center; color:var(--text-dim); font-size:11px;">... and ${parsedRows.length - 200} more rows</td></tr>` : ''}
+        </tbody>
+      </table>
+    `;
+
+    const btn = document.getElementById('confirm-upload-btn');
+    if (valid === 0) {
+      btn.disabled = true;
+      btn.style.opacity = '0.4';
+      btn.style.cursor = 'not-allowed';
+      btn.textContent = 'Nothing to import';
+    } else {
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.style.cursor = 'pointer';
+      btn.textContent = `Confirm Import (${valid})`;
+    }
+  }
+
+  async function confirmUpload() {
+    const valid = parsedRows.filter(r => r.valid);
+    if (valid.length === 0) return;
+
+    // ============== DUPLICATE UPLOAD CHECK ==============
+    // Detect if this upload was already done by checking transactions for matching
+    // (itemId, qty, date) combinations. If 80%+ of rows already exist, warn user.
+    let duplicateCount = 0;
+    const recentTxKeys = new Set();
+    transactions.forEach(t => {
+      const dayKey = new Date(t.ts).toISOString().slice(0, 10);
+      recentTxKeys.add(`${t.itemId}|${t.qty}|${t.type}|${dayKey}`);
+    });
+    valid.forEach(r => {
+      const itemId = r.item ? r.item.id : r.sku;
+      let dayKey = new Date().toISOString().slice(0, 10);
+      if (r.date) {
+        const parsed = parseDate(r.date);
+        if (parsed) dayKey = parsed.toISOString().slice(0, 10);
+      }
+      const key = `${itemId}|${r.qty}|${uploadType}|${dayKey}`;
+      if (recentTxKeys.has(key)) duplicateCount++;
+    });
+
+    if (duplicateCount > 0) {
+      const pct = Math.round((duplicateCount / valid.length) * 100);
+      const msg = `⚠️ DUPLICATE WARNING\n\n${duplicateCount} out of ${valid.length} rows (${pct}%) look like they were already uploaded earlier.\n\nIf you import again, stock will be ${uploadType === 'In' ? 'ADDED' : 'REDUCED'} a SECOND time, making your numbers wrong.\n\nDo you want to continue anyway?\n\n(Click Cancel and check Activity tab if unsure)`;
+      if (!confirm(msg)) return;
+    }
+
+    // ============== FIREBASE SIZE LIMIT CHECK ==============
+    // Firestore has a 1 MB limit per document. Estimate size after this import.
+    const projectedTransactions = transactions.length + valid.length;
+    const estimatedSizeKB = Math.round((projectedTransactions * 0.18) + (items.length * 0.3) + 5);
+    if (estimatedSizeKB > 900) {
+      const msg = `⚠️ STORAGE LIMIT WARNING\n\nAfter this import, your data will be approximately ${estimatedSizeKB} KB.\n\nFirebase free plan has a 1024 KB (1 MB) limit per document. If you exceed this, the cloud save will FAIL and you may lose data.\n\nCurrent transactions: ${transactions.length}\nAfter import: ${projectedTransactions}\n\nRecommendation:\n• Don't import old historical data — only recent sales\n• Or delete old transactions in Activity tab first\n\nContinue anyway? (Risky)`;
+      if (!confirm(msg)) return;
+    }
+
+    // Apply pending new entities first
+    pendingNewSuppliers.forEach(s => {
+      if (!suppliers.find(x => x.id === s.id)) suppliers.push({ ...s, contact: '', phone: '', notes: '', lt: null, sf: null });
+    });
+    pendingNewBrands.forEach(b => {
+      if (!brands.find(x => x.id === b.id)) brands.push({ ...b });
+    });
+    pendingNewSkus.forEach(sk => {
+      if (!items.find(x => x.id === sk.id)) items.push({ ...sk });
+    });
+
+    // Re-resolve items for rows that needed creation
+    const ts = Date.now();
+    valid.forEach((r, i) => {
+      let txTs = ts + i;
+      if (r.date) {
+        const parsed = parseDate(r.date);
+        if (parsed) txTs = parsed.getTime() + i;
+      }
+      const itemId = r.item ? r.item.id : r.sku; // newly created SKU uses sku code as id
+      transactions.push({
+        id: 't' + (ts + i).toString(36) + Math.random().toString(36).slice(2, 5),
+        itemId,
+        type: uploadType,
+        qty: r.qty,
+        note: r.note,
+        ts: txTs
+      });
+    });
+
+    pendingNewSuppliers = [];
+    pendingNewBrands = [];
+    pendingNewSkus = [];
+
+    // Show progress for big imports
+    const isBigImport = valid.length > 1000;
+    if (isBigImport) {
+      showLoadingOverlay(`Saving ${fmt(valid.length)} rows to cloud...`);
+    }
+
+    await saveAll();
+
+    if (isBigImport) hideLoadingOverlay();
+
+    if (!lastSaveOk) {
+      // Save failed — undo the local changes so user can retry
+      // Remove the transactions we just added
+      transactions.splice(transactions.length - valid.length, valid.length);
+      alert('⚠️ Cloud save fail ho gaya!\n\nReasons:\n• Internet down\n• Data 1 MB limit cross kar gaya\n• Firestore rules block kar rahe hain\n\nUpload cancel ho gaya. Browser console (F12) mein details dekho.');
+      renderAll();
+      return;
+    }
+
+    closeModal('upload-modal');
+    renderAll();
+    switchTab('livestock');
+    toast(`✓ Imported ${valid.length} ${uploadType === 'In' ? 'purchase' : 'sale'} row${valid.length===1?'':'s'}`);
+  }
+
+  // Robust date parser — handles dd/mm/yyyy, yyyy-mm-dd, JS Date strings
+  function parseDate(str) {
+    if (!str) return null;
+    if (str instanceof Date) return str;
+    const s = String(str).trim();
+    // dd/mm/yyyy or dd-mm-yyyy
+    const m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+    if (m) {
+      const day = parseInt(m[1]);
+      const mon = parseInt(m[2]) - 1;
+      let year = parseInt(m[3]);
+      if (year < 100) year += 2000;
+      return new Date(year, mon, day);
+    }
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // CSV download helpers
+  function downloadCSV(filename, headers, rows) {
+    const csv = [headers.join(',')]
+      .concat(rows.map(r => r.map(cell => {
+        const s = String(cell ?? '');
+        return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      }).join(',')))
+      .join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadTemplate(type) {
+    const today = new Date().toISOString().slice(0, 10);
+    const sample = items.slice(0, 3);
+    const rows = sample.length > 0
+      ? sample.map((i, idx) => [i.id, type === 'In' ? 12 : 1, today, type === 'In' ? `Bill ${1000+idx}` : `Customer ${idx+1}`])
+      : [['LV-SLM-32-IND', type === 'In' ? 12 : 1, today, type === 'In' ? 'Bill 1001' : 'Customer 1']];
+    downloadCSV(
+      type === 'In' ? 'purchase_template.csv' : 'sale_template.csv',
+      ['SKU Code', 'Quantity', 'Date', 'Note'],
+      rows
+    );
+    toast(`${type === 'In' ? 'Purchase' : 'Sale'} template downloaded`);
+  }
+
+  function downloadCurrentTemplate() {
+    downloadTemplate(uploadType);
+  }
+
+  function downloadSKUList() {
+    const rows = items.map(i => {
+      const b = getBrand(i.brandId);
+      const sup = getItemSupplier(i);
+      return [i.id, i.name, i.size || '', i.color || '', b?.name || '', sup?.name || ''];
+    });
+    downloadCSV('current_skus.csv', ['SKU Code', 'Item Name', 'Size', 'Color', 'Brand', 'Supplier'], rows);
+    toast('SKU list downloaded');
+  }
+
+  // Download Reorder/FastMover list as Excel (.xlsx) — grouped by Supplier
+  function downloadReorderXLSX(kind) {
+    // kind = 'regular' | 'fastmover'
+    // Use the currently selected filter from the matching tab
+    const supEl = kind === 'fastmover' ? document.getElementById('fm-supplier') : document.getElementById('reorder-supplier');
+    const brEl  = kind === 'fastmover' ? document.getElementById('fm-brand')    : document.getElementById('reorder-brand');
+    const supId = supEl ? supEl.value : 'all';
+    const brId  = brEl  ? brEl.value  : 'all';
+
+    const { regular, fastMovers } = getReorderBuckets(supId, brId);
+    const list = kind === 'fastmover' ? fastMovers : regular;
+
+    if (list.length === 0) {
+      alert(kind === 'fastmover' ? 'No fast movers to download right now.' : 'No regular reorders to download right now.');
+      return;
+    }
+
+    // Build rows
+    const headers = [
+      'Supplier', 'Supplier Phone', 'Brand', 'SKU Code', 'Item', 'Size', 'Color',
+      'Total Received', 'Total Sold', 'Sold in Days', 'Sold %', 'Current Stock',
+      'Order Qty', 'MOQ', 'Max Level', 'Lead Time (days)', 'Reason'
+    ];
+
+    const rows = list.map(r => {
+      const i = r.item;
+      const b = getBrand(i.brandId);
+      const sup = getItemSupplier(i);
+      const orderQty = Math.ceil(getReorderQty(i, r.stock));
+
+      // Calculate total received, total sold, and days span (first purchase → last sale)
+      let totalReceived = 0;
+      let totalSold = 0;
+      let firstPurchaseTs = null;
+      let lastSaleTs = 0;
+      transactions.forEach(t => {
+        if (t.itemId !== i.id) return;
+        if (t.type === 'In') {
+          totalReceived += Number(t.qty);
+          if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+        } else if (t.type === 'Out') {
+          totalSold += Number(t.qty);
+          if (t.ts > lastSaleTs) lastSaleTs = t.ts;
+        }
+      });
+      let daysSpan = 0;
+      if (firstPurchaseTs !== null) {
+        const endTs = lastSaleTs > 0 ? lastSaleTs : Date.now();
+        daysSpan = Math.max(1, Math.round((endTs - firstPurchaseTs) / (24 * 60 * 60 * 1000)));
+      }
+      const soldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
+
+      return [
+        sup?.name || '',
+        sup?.phone || '',
+        b?.name || '',
+        i.id,
+        i.name,
+        i.size || '',
+        i.color || '',
+        totalReceived,
+        totalSold,
+        daysSpan > 0 && totalSold > 0 ? daysSpan : '',
+        soldPct + '%',
+        Math.round(r.stock),
+        orderQty,
+        getEffectiveMOQ(i),
+        getEffectiveMax(i),
+        getBrandLT(i) || '',
+        getReorderReason(i, r.stock)
+      ];
+    });
+
+    // Build worksheet
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    // Column widths
+    ws['!cols'] = [
+      { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 22 },
+      { wch: 8 },  { wch: 12 },
+      { wch: 14 }, { wch: 12 }, { wch: 11 }, { wch: 9 },  // Total Received, Total Sold, Sold in Days, Sold %
+      { wch: 13 }, { wch: 11 }, { wch: 8 },
+      { wch: 11 }, { wch: 14 }, { wch: 36 }
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const sheetName = kind === 'fastmover' ? 'Fast Movers' : 'Reorder List';
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+
+    // Filename: include date + scope info
+    const today = new Date().toISOString().slice(0, 10);
+    let scope = 'all';
+    if (supId !== 'all') {
+      const sup = getSupplier(supId);
+      if (sup) scope = sup.name.replace(/[^a-z0-9]/gi, '_');
+    } else if (brId !== 'all') {
+      const b = getBrand(brId);
+      if (b) scope = b.name.replace(/[^a-z0-9]/gi, '_');
+    }
+    const prefix = kind === 'fastmover' ? 'FastMovers' : 'Reorder';
+    const filename = `${prefix}_${scope}_${today}.xlsx`;
+
+    XLSX.writeFile(wb, filename);
+    toast(`✓ Downloaded ${list.length} item${list.length===1?'':'s'} to ${filename}`);
+  }
+
+  // ============== CALCULATIONS ==============
+  // Cache stock by itemId — rebuilt whenever transactions change.
+  // This is critical for performance: without caching, getStock runs O(N×M)
+  // where N=items and M=transactions, freezing the browser at ~10K transactions.
+  let stockCache = null;
+  let stockCacheVersion = -1;
+  let dataVersion = 0; // bumped whenever transactions/items change
+
+  function bumpDataVersion() { dataVersion++; }
+
+  function buildStockCache() {
+    const cache = new Map();
+    // Initialize with startStock
+    items.forEach(i => cache.set(i.id, Number(i.startStock || 0)));
+    // Apply all transactions in one pass
+    transactions.forEach(t => {
+      const cur = cache.get(t.itemId);
+      if (cur === undefined) return; // item was deleted
+      cache.set(t.itemId, cur + (t.type === 'In' ? Number(t.qty) : -Number(t.qty)));
+    });
+    stockCache = cache;
+    stockCacheVersion = dataVersion;
+  }
+
+  function getStock(itemId) {
+    if (stockCacheVersion !== dataVersion || !stockCache) {
+      buildStockCache();
+    }
+    return stockCache.get(itemId) ?? 0;
+  }
+
+  // ----- LT/SF live on the Supplier only -----
+  function getSupplierLT(item) {
+    const s = getItemSupplier(item);
+    if (s && s.lt != null && s.lt !== '' && !isNaN(s.lt) && Number(s.lt) > 0) return Number(s.lt);
+    return 0;
+  }
+  function getSupplierSF(item) {
+    const s = getItemSupplier(item);
+    if (s && s.sf != null && s.sf !== '' && !isNaN(s.sf) && Number(s.sf) > 0) return Number(s.sf);
+    return 1;
+  }
+  // Aliases kept for any internal callers
+  const getBrandLT = getSupplierLT;
+  const getBrandSF = getSupplierSF;
+
+  function getROP(item) {
+    // Old way: ADC × LT × SF (all manually set)
+    const manualROP = (Number(item.adc) || 0) * getSupplierLT(item) * getSupplierSF(item);
+    if (manualROP > 0) return manualROP;
+
+    // NEW: Auto-calculate from transaction history if manual values not set
+    // Uses Average Daily Sale × 30 days (monthly safety stock)
+    const auto = getAutoStats(item.id);
+    return auto.avgDailySale * 30;
+  }
+
+  // ============== AUTO-CALCULATE FROM TRANSACTIONS ==============
+  // For users who haven't set Max Level / MOQ / Lead Time manually,
+  // we calculate sensible defaults from their actual sales history.
+  // This is critical for non-technical users — they shouldn't have to fill
+  // 10 fields per SKU. Just upload purchase + sale → app figures it out.
+  let autoStatsCache = null;
+  let autoStatsVersion = -1;
+
+  function getAutoStats(itemId) {
+    // Cache by dataVersion (same as stockCache) for performance
+    if (autoStatsVersion !== dataVersion || !autoStatsCache) {
+      autoStatsCache = new Map();
+      autoStatsVersion = dataVersion;
+    }
+    if (autoStatsCache.has(itemId)) return autoStatsCache.get(itemId);
+
+    let totalReceived = 0;
+    let totalSold = 0;
+    let firstPurchaseTs = null;
+    let lastBatchQty = 0;
+    let lastBatchTs = 0;
+
+    transactions.forEach(t => {
+      if (t.itemId !== itemId) return;
+      if (t.type === 'In') {
+        totalReceived += Number(t.qty);
+        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+        if (t.ts > lastBatchTs) {
+          lastBatchTs = t.ts;
+          lastBatchQty = Number(t.qty);
+        }
+      } else if (t.type === 'Out') {
+        totalSold += Number(t.qty);
+      }
+    });
+
+    // Calculate daily sale rate based on actual data
+    let avgDailySale = 0;
+    if (totalSold > 0 && firstPurchaseTs !== null) {
+      const daysSinceFirst = Math.max(1, (Date.now() - firstPurchaseTs) / (24 * 60 * 60 * 1000));
+      avgDailySale = totalSold / daysSinceFirst;
+    }
+
+    const stats = {
+      totalReceived,
+      totalSold,
+      avgDailySale,
+      lastBatchQty,
+      // Auto-calculated suggestions:
+      autoMaxLevel: Math.ceil(avgDailySale * 60),  // 2 months supply
+      autoMOQ: lastBatchQty,                        // re-order what you ordered before
+      autoReorderThreshold: avgDailySale * 30       // 1 month safety
+    };
+    autoStatsCache.set(itemId, stats);
+    return stats;
+  }
+
+  // Helper to get effective Max Level (manual or auto)
+  function getEffectiveMax(item) {
+    const manual = Number(item.max || 0);
+    if (manual > 0) return manual;
+    return getAutoStats(item.id).autoMaxLevel;
+  }
+
+  // Helper to get effective MOQ (manual or auto)
+  function getEffectiveMOQ(item) {
+    const manual = Number(item.moq || 0);
+    if (manual > 0) return manual;
+    return getAutoStats(item.id).autoMOQ;
+  }
+
+  // ----- Velocity-based reorder check -----
+  // For each Stock IN ("batch"), check sales within `windowDays` of receipt.
+  // If any batch sold ≥ thresholdPct% of its received qty within that window,
+  // SKU is fast-moving → flag for reorder.
+  // Returns { triggered, batches: [{ts, received, soldInWindow, pct, thresholdMet}] }
+  // Cache for getVelocityCheck — same dataVersion as stockCache.
+  let txByItemCache = null;
+  let txByItemVersion = -1;
+  function buildTxByItemCache() {
+    const map = new Map();
+    transactions.forEach(t => {
+      if (!map.has(t.itemId)) map.set(t.itemId, []);
+      map.get(t.itemId).push(t);
+    });
+    // Sort each item's transactions by timestamp (ascending)
+    map.forEach(arr => arr.sort((a, b) => a.ts - b.ts));
+    txByItemCache = map;
+    txByItemVersion = dataVersion;
+  }
+
+  function getVelocityCheck(itemId) {
+    const windowDays = Number(settings.velocityDays) || 30;
+    const thresholdPct = Number(settings.velocityPct) || 50;
+    const windowMs = windowDays * 24 * 60 * 60 * 1000;
+
+    if (txByItemVersion !== dataVersion || !txByItemCache) {
+      buildTxByItemCache();
+    }
+    const itemTx = txByItemCache.get(itemId) || [];
+
+    const batches = [];
+    itemTx.forEach(tx => {
+      if (tx.type !== 'In') return;
+      const batchEnd = tx.ts + windowMs;
+      // Sum OUT transactions within the window after this batch
+      const soldInWindow = itemTx
+        .filter(t => t.type === 'Out' && t.ts >= tx.ts && t.ts <= batchEnd)
+        .reduce((s, t) => s + Number(t.qty), 0);
+      // But don't credit a batch with sales it couldn't have supplied:
+      // cap at what this batch actually contributed (Number(tx.qty))
+      const credited = Math.min(soldInWindow, Number(tx.qty));
+      const pct = tx.qty > 0 ? (credited / Number(tx.qty)) * 100 : 0;
+      const windowEnded = Date.now() >= batchEnd;
+      const thresholdMet = pct >= thresholdPct;
+      batches.push({
+        ts: tx.ts,
+        received: Number(tx.qty),
+        soldInWindow: credited,
+        pct,
+        windowEnded,
+        thresholdMet
+      });
+    });
+
+    // "Drop off when stock goes back up": once a NEW batch arrives AFTER a
+    // triggering batch, the trigger only counts if sales since that newest batch
+    // also hit the threshold within the window. So we look at the LATEST batch only.
+    const latest = batches[batches.length - 1];
+    let triggered = false;
+    if (latest && latest.thresholdMet) {
+      triggered = true;
+    }
+
+    return { triggered, batches };
+  }
+  function getStatus(item, stock) {
+    const rop = getROP(item);
+    if (stock <= 0) return 'outofstock';
+    if (rop > 0 && stock <= rop) return 'reorder';
+    // Velocity-based trigger: even if stock is OK, fast sell-through means we should reorder
+    if (getVelocityCheck(item.id).triggered) return 'reorder';
+    if (rop > 0 && stock <= rop * 1.25) return 'low';
+    if (stock >= Number(item.max || Infinity)) return 'overstock';
+    return 'healthy';
+  }
+  function statusLabel(s) {
+    return { outofstock: 'Out of Stock', reorder: 'Reorder Now', low: 'Low', healthy: 'Healthy', overstock: 'Overstock' }[s];
+  }
+  // Why a SKU is in the reorder list — used in card subtitles
+  function getReorderReason(item, stock) {
+    const rop = getROP(item);
+    if (stock <= 0) return 'Out of stock';
+    const v = getVelocityCheck(item.id);
+    if (v.triggered) {
+      const latest = v.batches[v.batches.length - 1];
+      const pctText = Math.round(latest.pct);
+      const settings_days = Number(settings.velocityDays) || 30;
+      return `Sold ${pctText}% in ${settings_days} days`;
+    }
+    if (rop > 0 && stock <= rop) return `Below reorder point (${fmt(rop, 1)})`;
+    return 'Low stock';
+  }
+  // Suggested order qty for a SKU.
+  // - Normal items: max(MOQ, Max Level − Current Stock) → just refill the shop
+  // - Fast movers (velocity-triggered): the LAST received batch × multiplier (default 2x)
+  //   "You sold most of 4 pieces fast → next time order 8."
+  // We always honor MOQ as a floor.
+  function getReorderQty(item, stock) {
+    // Use effective values (manual if set, auto-calculated if not)
+    const effMOQ = getEffectiveMOQ(item);
+    const effMax = getEffectiveMax(item);
+    const baseRefill = Math.max(effMOQ, effMax - stock);
+    const v = getVelocityCheck(item.id);
+    if (v.triggered && v.batches.length > 0) {
+      const lastBatch = v.batches[v.batches.length - 1];
+      const mult = Number(settings.fastMoverMultiplier) || 2;
+      const fastQty = Number(lastBatch.received) * mult;
+      // Take the larger of the two — never order less than what refilling needs
+      return Math.max(baseRefill, fastQty);
+    }
+    return baseRefill;
+  }
+  function getDaysOfCover(item, stock) {
+    if (!item.adc || item.adc <= 0) return Infinity;
+    return stock / Number(item.adc);
+  }
+  function getBrand(brandId) { return brands.find(b => b.id === brandId); }
+  function getSupplier(supplierId) { return suppliers.find(s => s.id === supplierId); }
+  function getItemSupplier(item) {
+    const b = getBrand(item.brandId);
+    return b ? getSupplier(b.supplierId) : null;
+  }
+
+  // FILTER HELPERS
+  function brandsForSupplier(supplierId) {
+    return supplierId === 'all' ? brands : brands.filter(b => b.supplierId === supplierId);
+  }
+  function fillBrandDropdown(selectId, supplierId) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const cur = sel.value;
+    const list = brandsForSupplier(supplierId);
+    sel.innerHTML = '<option value="all">All Brands</option>' +
+      list.map(b => `<option value="${b.id}">${escapeHtml(b.name)}</option>`).join('');
+    sel.value = list.find(b => b.id === cur) ? cur : 'all';
+  }
+  function fillSupplierDropdown(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="all">All Suppliers</option>' +
+      suppliers.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+    sel.value = suppliers.find(s => s.id === cur) || cur === 'all' ? cur : 'all';
+  }
+
+  function onDashSupplierChange() { fillBrandDropdown('dash-brand', document.getElementById('dash-supplier').value); renderDashboard(); }
+  function onInvSupplierChange() { fillBrandDropdown('inv-brand', document.getElementById('inv-supplier').value); renderInventory(); }
+  function onReorderSupplierChange() { fillBrandDropdown('reorder-brand', document.getElementById('reorder-supplier').value); renderReorder(); }
+  function onFastMoverSupplierChange() { fillBrandDropdown('fm-brand', document.getElementById('fm-supplier').value); renderFastMovers(); }
+  function onActSupplierChange() { fillBrandDropdown('act-brand', document.getElementById('act-supplier').value); renderActivity(); }
+  function onLiveStockSupplierChange() { fillBrandDropdown('ls-brand', document.getElementById('ls-supplier').value); renderLiveStock(); }
+
+  function applyFilters(supplierId, brandId, q) {
+    return items.filter(i => {
+      const b = getBrand(i.brandId);
+      if (!b) return false;
+      if (supplierId !== 'all' && b.supplierId !== supplierId) return false;
+      if (brandId !== 'all' && i.brandId !== brandId) return false;
+      if (q) {
+        const hay = `${i.name} ${i.size || ''} ${i.color || ''} ${i.category || ''} ${b.name} ${i.id}`.toLowerCase();
+        if (!hay.includes(q.toLowerCase())) return false;
+      }
+      return true;
+    });
+  }
+
+  function renderAll() {
+    fillSupplierDropdown('ls-supplier');
+    fillSupplierDropdown('dash-supplier');
+    fillSupplierDropdown('inv-supplier');
+    fillSupplierDropdown('reorder-supplier');
+    fillSupplierDropdown('fm-supplier');
+    fillSupplierDropdown('act-supplier');
+    fillBrandDropdown('ls-brand', document.getElementById('ls-supplier').value);
+    fillBrandDropdown('dash-brand', document.getElementById('dash-supplier').value);
+    fillBrandDropdown('inv-brand', document.getElementById('inv-supplier').value);
+    fillBrandDropdown('reorder-brand', document.getElementById('reorder-supplier').value);
+    fillBrandDropdown('fm-brand', document.getElementById('fm-supplier').value);
+    fillBrandDropdown('act-brand', document.getElementById('act-supplier').value);
+    // Settings inputs
+    const setVd = document.getElementById('set-vd');
+    const setVp = document.getElementById('set-vp');
+    const setRm = document.getElementById('set-rm');
+    if (setVd) setVd.value = settings.velocityDays;
+    if (setVp) setVp.value = settings.velocityPct;
+    if (setRm) setRm.value = settings.fastMoverMultiplier ?? 2;
+    renderLiveStock();
+    renderDashboard();
+    renderSuppliers();
+    renderBrands();
+    renderInventory();
+    renderReorder();
+    renderFastMovers();
+    renderActivity();
+    renderUsersList();
+  }
+
+  async function saveVelocitySettings() {
+    const vd = parseFloat(document.getElementById('set-vd').value);
+    const vp = parseFloat(document.getElementById('set-vp').value);
+    const rm = parseFloat(document.getElementById('set-rm').value);
+    if (isNaN(vd) || vd < 1) { alert('Window must be at least 1 day'); return; }
+    if (isNaN(vp) || vp < 1 || vp > 100) { alert('Threshold must be 1-100'); return; }
+    if (isNaN(rm) || rm < 1) { alert('Multiplier must be at least 1'); return; }
+    settings.velocityDays = vd;
+    settings.velocityPct = vp;
+    settings.fastMoverMultiplier = rm;
+    await saveAll();
+    renderAll();
+    toast(`✓ ${vp}% in ${vd} days · fast movers ${rm}×`);
+  }
+
+  function renderLiveStock() {
+    const supId = document.getElementById('ls-supplier').value;
+    const brId = document.getElementById('ls-brand').value;
+    const q = document.getElementById('ls-search').value;
+    const statusFilter = document.getElementById('ls-status').value;
+
+    let visible = applyFilters(supId, brId, q);
+    // Compute stock + status once per row
+    const rows = visible.map(i => {
+      const stock = getStock(i.id);
+      const status = getStatus(i, stock);
+      return { item: i, stock, status };
+    });
+
+    // Apply status filter
+    let filtered = rows;
+    if (statusFilter === 'instock') {
+      filtered = rows.filter(r => r.stock > 0);
+    } else if (statusFilter === 'lowstock') {
+      filtered = rows.filter(r => r.status === 'outofstock' || r.status === 'reorder' || r.status === 'low');
+    }
+
+    // Sort: out of stock first, then reorder/low, then by stock desc
+    const sortOrder = { outofstock: 0, reorder: 1, low: 2, healthy: 3, overstock: 4 };
+    filtered.sort((a, b) => {
+      const o = sortOrder[a.status] - sortOrder[b.status];
+      if (o !== 0) return o;
+      return b.stock - a.stock;
+    });
+
+    document.getElementById('ls-count').textContent =
+      `${filtered.length} of ${items.length} item${items.length === 1 ? '' : 's'}`;
+
+    const tbody = document.getElementById('ls-tbody');
+    if (filtered.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="4"><div class="empty"><div class="empty-icon">📦</div>No items match.</div></td></tr>`;
+      return;
+    }
+
+    // Performance cap: 500 rows max
+    const MAX_LS = 500;
+    const allFilteredCount = filtered.length;
+    const displayRows = filtered.slice(0, MAX_LS);
+    const lsTruncated = allFilteredCount > MAX_LS;
+
+    tbody.innerHTML = displayRows.map(r => {
+      const i = r.item;
+      const b = getBrand(i.brandId);
+      // Color stock number red if 0, orange if low/reorder, white otherwise
+      let stockColor = 'var(--text)';
+      if (r.status === 'outofstock') stockColor = 'var(--bad)';
+      else if (r.status === 'reorder' || r.status === 'low') stockColor = 'var(--warn)';
+      return `
+        <tr>
+          <td>
+            <div style="font-weight:500">${escapeHtml(i.name)}</div>
+            <div style="font-size:11px; margin-top:3px;">
+              ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
+              ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
+              <span class="sku-tag">${i.id}</span>
+            </div>
+          </td>
+          <td>${escapeHtml(b?.name || '—')}</td>
+          <td class="num"><strong style="color:${stockColor}; font-size:15px;">${fmt(r.stock, 0)}</strong></td>
+          <td><span class="pill ${r.status}">${statusLabel(r.status)}</span></td>
+        </tr>
+      `;
+    }).join('') + (lsTruncated ? `<tr><td colspan="4" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing ${MAX_LS} of ${fmt(allFilteredCount)} items. Use search/filter to find specific ones.</td></tr>` : '');
+  }
+
+  function renderDashboard() {
+    const supId = document.getElementById('dash-supplier').value;
+    const brId = document.getElementById('dash-brand').value;
+    const q = document.getElementById('dash-search').value;
+    const visible = applyFilters(supId, brId, q);
+
+    let outCount = 0, reorderCount = 0, totalValue = 0;
+    items.forEach(i => {
+      const s = getStock(i.id);
+      const status = getStatus(i, s);
+      if (status === 'outofstock') outCount++;
+      else if (status === 'reorder' || status === 'low') reorderCount++;
+      totalValue += s * (Number(i.cost) || 0);
+    });
+    document.getElementById('kpi-total').textContent = items.length;
+    document.getElementById('kpi-total-meta').textContent =
+      `${suppliers.length} supplier${suppliers.length===1?'':'s'} · ${brands.length} brand${brands.length===1?'':'s'}`;
+    document.getElementById('kpi-out').textContent = outCount;
+    document.getElementById('kpi-reorder').textContent = reorderCount;
+    document.getElementById('kpi-value').textContent = '₹' + fmtCompact(totalValue);
+
+    const tbody = document.getElementById('dash-tbody');
+    if (visible.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="7"><div class="empty"><div class="empty-icon">📦</div>No SKUs match. Adjust filters or add an SKU.</div></td></tr>`;
+      return;
+    }
+    // Performance cap: 500 rows max
+    const MAX_DASH = 500;
+    const dashTotalCount = visible.length;
+    const displayDash = visible.slice(0, MAX_DASH);
+    const dashTruncated = dashTotalCount > MAX_DASH;
+
+    tbody.innerHTML = displayDash.map(i => {
+      const stock = getStock(i.id);
+      const rop = getROP(i);
+      const status = getStatus(i, stock);
+      const doc = getDaysOfCover(i, stock);
+      const fillPct = Math.max(0, Math.min(100, (stock / Math.max(i.max || 1, 1)) * 100));
+      const fillColor = status === 'outofstock' ? 'var(--bad)' : (status === 'reorder' || status === 'low') ? 'var(--warn)' : 'var(--good)';
+      const b = getBrand(i.brandId);
+      const sup = getItemSupplier(i);
+      return `
+        <tr>
+          <td>
+            <div style="font-weight:500">${escapeHtml(i.name)}</div>
+            <div style="font-size:11px; margin-top:3px;">
+              ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
+              ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
+              <span class="sku-tag">${i.id}</span>
+            </div>
+          </td>
+          <td>${escapeHtml(b?.name || '—')}</td>
+          <td style="font-size:12px; color:var(--text-dim)">${escapeHtml(sup?.name || '—')}</td>
+          <td class="num">
+            <div class="stock-bar-wrap" style="justify-content:flex-end">
+              <span>${fmt(stock)}</span>
+              <div class="stock-bar"><div class="stock-bar-fill" style="width:${fillPct}%; background:${fillColor}"></div></div>
+            </div>
+          </td>
+          <td class="num">${fmt(rop, 1)}</td>
+          <td class="num">${doc === Infinity ? '∞' : fmt(doc, 1)}</td>
+          <td><span class="pill ${status}">${statusLabel(status)}</span></td>
+        </tr>
+      `;
+    }).join('') + (dashTruncated ? `<tr><td colspan="7" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing ${MAX_DASH} of ${fmt(dashTotalCount)} SKUs. Use search/filter to find specific items.</td></tr>` : '');
+  }
+
+  function renderSuppliers() {
+    const wrap = document.getElementById('supplier-view');
+    if (currentSupplierFocus) {
+      const sup = getSupplier(currentSupplierFocus);
+      if (!sup) { currentSupplierFocus = null; return renderSuppliers(); }
+      const supBrands = brands.filter(b => b.supplierId === sup.id);
+      wrap.innerHTML = `
+        <div class="breadcrumb">
+          <a onclick="currentSupplierFocus=null; renderSuppliers()">← All Suppliers</a>
+          <span class="sep">/</span>
+          <span>${escapeHtml(sup.name)}</span>
+        </div>
+        <div class="setting-card" style="margin-bottom:18px">
+          <h3>${escapeHtml(sup.name)}</h3>
+          <p>
+            ${sup.contact ? `<strong>Contact:</strong> ${escapeHtml(sup.contact)}<br>` : ''}
+            ${sup.phone ? `<strong>Phone:</strong> ${escapeHtml(sup.phone)}<br>` : ''}
+            ${sup.notes ? `<strong>Notes:</strong> ${escapeHtml(sup.notes)}<br>` : ''}
+            <strong>Lead Time:</strong> ${sup.lt != null && sup.lt !== '' ? `${sup.lt} days` : '<em style="color:var(--text-dim)">not set</em>'}<br>
+            <strong>Safety Factor:</strong> ${sup.sf != null && sup.sf !== '' ? sup.sf : '<em style="color:var(--text-dim)">not set</em>'}
+          </p>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-ghost btn-sm" onclick="editSupplier('${sup.id}')">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteSupplier('${sup.id}')">Delete Supplier</button>
+          </div>
+        </div>
+        <h3 style="font-family: 'Bricolage Grotesque', sans-serif; font-weight:700; margin: 0 0 12px;">Brands from this supplier</h3>
+        ${supBrands.length === 0 ? `<div class="empty"><div class="empty-icon">🏷️</div>No brands yet from this supplier.</div>` :
+          `<div class="group-grid">${supBrands.map(b => groupCardForBrand(b)).join('')}</div>`}
+      `;
+      return;
+    }
+    if (suppliers.length === 0) {
+      wrap.innerHTML = `<div class="empty"><div class="empty-icon">🏬</div>No suppliers yet. Click "+ Supplier" to add one.</div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="group-grid">${suppliers.map(s => {
+      const supBrands = brands.filter(b => b.supplierId === s.id);
+      const supItems = items.filter(i => {
+        const b = getBrand(i.brandId);
+        return b && b.supplierId === s.id;
+      });
+      let needsCount = 0, outCount = 0;
+      supItems.forEach(i => {
+        const st = getStatus(i, getStock(i.id));
+        if (st === 'outofstock') outCount++;
+        else if (st === 'reorder' || st === 'low') needsCount++;
+      });
+      return `
+        <div class="group-card" onclick="currentSupplierFocus='${s.id}'; renderSuppliers()">
+          <div class="group-card-name">${escapeHtml(s.name)}</div>
+          <div style="font-size:11px; color:var(--text-dim); margin-bottom:10px;">${escapeHtml(s.contact || '')} ${s.phone ? '· ' + escapeHtml(s.phone) : ''}</div>
+          <div class="group-card-stats">
+            <div class="group-card-stat"><strong>${supBrands.length}</strong> brands</div>
+            <div class="group-card-stat"><strong>${supItems.length}</strong> SKUs</div>
+          </div>
+          <div class="group-card-flag">
+            ${outCount > 0 ? `<span class="pill outofstock">${outCount} out</span>` : ''}
+            ${needsCount > 0 ? `<span class="pill reorder">${needsCount} reorder</span>` : ''}
+            ${outCount === 0 && needsCount === 0 && supItems.length > 0 ? `<span class="pill healthy">All healthy</span>` : ''}
+          </div>
+        </div>
+      `;
+    }).join('')}</div>`;
+  }
+
+  function groupCardForBrand(b) {
+    const sup = getSupplier(b.supplierId);
+    const brandItems = items.filter(i => i.brandId === b.id);
+    let needsCount = 0, outCount = 0;
+    brandItems.forEach(i => {
+      const st = getStatus(i, getStock(i.id));
+      if (st === 'outofstock') outCount++;
+      else if (st === 'reorder' || st === 'low') needsCount++;
+    });
+    return `
+      <div class="group-card" onclick="currentBrandFocus='${b.id}'; switchTab('brands'); renderBrands()">
+        <div class="group-card-name">${escapeHtml(b.name)}</div>
+        <div style="font-size:11px; color:var(--text-dim); margin-bottom:10px;">via ${escapeHtml(sup?.name || '—')}</div>
+        <div class="group-card-stats">
+          <div class="group-card-stat"><strong>${brandItems.length}</strong> SKUs</div>
+        </div>
+        <div class="group-card-flag">
+          ${outCount > 0 ? `<span class="pill outofstock">${outCount} out</span>` : ''}
+          ${needsCount > 0 ? `<span class="pill reorder">${needsCount} reorder</span>` : ''}
+          ${outCount === 0 && needsCount === 0 && brandItems.length > 0 ? `<span class="pill healthy">All healthy</span>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderBrands() {
+    const wrap = document.getElementById('brand-view');
+    if (currentBrandFocus) {
+      const b = getBrand(currentBrandFocus);
+      if (!b) { currentBrandFocus = null; return renderBrands(); }
+      const sup = getSupplier(b.supplierId);
+      const brandItems = items.filter(i => i.brandId === b.id);
+      wrap.innerHTML = `
+        <div class="breadcrumb">
+          <a onclick="currentBrandFocus=null; renderBrands()">← All Brands</a>
+          <span class="sep">/</span>
+          <span>${escapeHtml(b.name)}</span>
+        </div>
+        <div class="setting-card" style="margin-bottom:18px">
+          <h3>${escapeHtml(b.name)}</h3>
+          <p>
+            Supplier: <strong>${escapeHtml(sup?.name || '—')}</strong><br>
+            <strong>Lead Time:</strong> ${sup && sup.lt != null && sup.lt !== '' ? `${sup.lt} days <em style="color:var(--text-dim); font-size:11px">(from supplier)</em>` : '<em style="color:var(--text-dim)">not set on supplier</em>'}<br>
+            <strong>Safety Factor:</strong> ${sup && sup.sf != null && sup.sf !== '' ? `${sup.sf} <em style="color:var(--text-dim); font-size:11px">(from supplier)</em>` : '<em style="color:var(--text-dim)">not set on supplier</em>'}
+          </p>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-ghost btn-sm" onclick="editBrand('${b.id}')">Edit Brand</button>
+            ${sup ? `<button class="btn btn-ghost btn-sm" onclick="editSupplier('${sup.id}')">Edit Supplier</button>` : ''}
+            <button class="btn btn-danger btn-sm" onclick="deleteBrand('${b.id}')">Delete Brand</button>
+          </div>
+        </div>
+        <h3 style="font-family: 'Bricolage Grotesque', sans-serif; font-weight:700; margin: 0 0 12px;">SKUs in ${escapeHtml(b.name)}</h3>
+        ${brandItems.length === 0 ? `<div class="empty"><div class="empty-icon">👕</div>No SKUs yet for this brand.</div>` :
+          renderItemTable(brandItems)}
+      `;
+      return;
+    }
+    if (brands.length === 0) {
+      wrap.innerHTML = `<div class="empty"><div class="empty-icon">🏷️</div>No brands yet. Click "+ Brand" to add one.</div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="group-grid">${brands.map(b => groupCardForBrand(b)).join('')}</div>`;
+  }
+
+  function renderItemTable(list) {
+    return `<div class="table-wrap"><table>
+      <thead><tr>
+        <th>SKU / Item</th><th class="num">Cost</th><th class="num">Sell</th>
+        <th class="num">Stock</th><th class="num">ROP</th><th>Status</th><th></th>
+      </tr></thead>
+      <tbody>${list.map(i => {
+        const stock = getStock(i.id);
+        const status = getStatus(i, stock);
+        return `<tr>
+          <td>
+            <div style="font-weight:500">${escapeHtml(i.name)}</div>
+            <div style="font-size:11px; margin-top:3px;">
+              ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
+              ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
+              <span class="sku-tag">${i.id}</span>
+            </div>
+          </td>
+          <td class="num">₹${fmt(i.cost)}</td>
+          <td class="num">₹${fmt(i.sell)}</td>
+          <td class="num"><strong>${fmt(stock)}</strong></td>
+          <td class="num">${fmt(getROP(i), 1)}</td>
+          <td><span class="pill ${status}">${statusLabel(status)}</span></td>
+          <td style="text-align:right">
+            <button class="btn btn-ghost btn-sm" onclick="editItem('${i.id}')">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteItem('${i.id}')">×</button>
+          </td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>`;
+  }
+
+  function renderInventory() {
+    const supId = document.getElementById('inv-supplier').value;
+    const brId = document.getElementById('inv-brand').value;
+    const q = document.getElementById('inv-search').value;
+    const allVisible = applyFilters(supId, brId, q);
+    const tbody = document.getElementById('inv-tbody');
+    if (allVisible.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="12"><div class="empty"><div class="empty-icon">📋</div>No SKUs.</div></td></tr>`;
+      return;
+    }
+    // Performance cap: 500 rows max
+    const MAX = 500;
+    const visible = allVisible.slice(0, MAX);
+    const truncated = allVisible.length > MAX;
+
+    tbody.innerHTML = visible.map(i => {
+      const stock = getStock(i.id);
+      const status = getStatus(i, stock);
+      const b = getBrand(i.brandId);
+      const sup = getItemSupplier(i);
+      const lt = getBrandLT(i);
+      const sf = getBrandSF(i);
+      return `
+        <tr>
+          <td>
+            <div style="font-weight:500">${escapeHtml(i.name)}</div>
+            <div style="font-size:11px; margin-top:3px;">
+              ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
+              ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
+              <span class="sku-tag">${i.id}</span>
+            </div>
+          </td>
+          <td>${escapeHtml(b?.name || '—')}</td>
+          <td style="font-size:12px; color:var(--text-dim)">${escapeHtml(sup?.name || '—')}</td>
+          <td class="num">₹${fmt(i.cost)}</td>
+          <td class="num">₹${fmt(i.sell)}</td>
+          <td class="num">${fmt(i.adc, 1)}</td>
+          <td class="num">${lt > 0 ? fmt(lt, 0) : '—'}</td>
+          <td class="num">${sf !== 1 ? fmt(sf, 2) : '—'}</td>
+          <td class="num">${fmt(i.moq, 0)}</td>
+          <td class="num"><strong>${fmt(stock, 0)}</strong></td>
+          <td><span class="pill ${status}">${statusLabel(status)}</span></td>
+          <td style="text-align:right; white-space:nowrap">
+            <button class="btn btn-ghost btn-sm" onclick="editItem('${i.id}')">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteItem('${i.id}')">×</button>
+          </td>
+        </tr>
+      `;
+    }).join('') + (truncated ? `<tr><td colspan="12" style="text-align:center; padding:14px; color:var(--text-dim); font-size:12px; background:var(--panel-2);">Showing ${MAX} of ${fmt(allVisible.length)} SKUs. Use search/filter to find specific items.</td></tr>` : '');
+  }
+
+  // Returns { regular, fastMovers } — regular excludes fast movers so they only show in one tab.
+  function getReorderBuckets(supId, brId) {
+    const filtered = applyFilters(supId, brId, '');
+    const all = filtered.map(i => {
+      const stock = getStock(i.id);
+      const status = getStatus(i, stock);
+      const v = getVelocityCheck(i.id);
+      return { item: i, stock, status, velocity: v };
+    });
+
+    // REORDER LIST: out-of-stock OR below reorder point (regardless of fast-mover status)
+    // Logic: out-of-stock is urgent action; below-ROP is normal refill.
+    // Fast mover items that are ALSO out-of-stock will appear in BOTH tabs (dono actions zaruri hain)
+    // Fast mover items that still have healthy stock will ONLY appear in Fast Movers tab.
+    const regular = all.filter(r => r.status === 'outofstock' || r.status === 'reorder' || r.status === 'low')
+                       .filter(r => {
+                         // If item is fast mover AND has positive stock (just below ROP), exclude from regular
+                         // because Fast Movers tab is the right place for it.
+                         // Out-of-stock items always go in Reorder List.
+                         if (r.velocity.triggered && r.stock > 0) return false;
+                         return true;
+                       });
+
+    // FAST MOVERS: velocity triggered (regardless of stock level)
+    const fastMovers = all.filter(r => r.velocity.triggered);
+
+    const order = { outofstock: 0, reorder: 1, low: 2, healthy: 3, overstock: 4 };
+    fastMovers.sort((a, b) => order[a.status] - order[b.status]);
+    regular.sort((a, b) => order[a.status] - order[b.status]);
+    return { regular, fastMovers };
+  }
+
+  function renderReorder() {
+    const supId = document.getElementById('reorder-supplier').value;
+    const brId = document.getElementById('reorder-brand').value;
+    const { regular } = getReorderBuckets(supId, brId);
+
+    document.getElementById('reorder-count').textContent =
+      regular.length === 0 ? 'Nothing to reorder' : `${regular.length} SKU${regular.length===1?'':'s'} need ordering`;
+
+    const wrap = document.getElementById('reorder-content');
+    if (regular.length === 0) {
+      wrap.innerHTML = `<div class="table-wrap"><div class="empty"><div class="empty-icon">✓</div>No regular reorders. Anything fast-moving will be in the Fast Movers tab.</div></div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="reorder-grid">${regular.map(r => renderReorderCard(r, 'regular')).join('')}</div>`;
+  }
+
+  function renderFastMovers() {
+    const supId = document.getElementById('fm-supplier').value;
+    const brId = document.getElementById('fm-brand').value;
+    const { fastMovers } = getReorderBuckets(supId, brId);
+
+    // Update the explainer with current settings
+    const expl = document.getElementById('fm-explainer');
+    if (expl) {
+      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% or more of the last batch sold within ${settings.velocityDays} days. Suggested order = last batch × ${settings.fastMoverMultiplier} (so you stock up before they run out).`;
+    }
+
+    document.getElementById('fm-count').textContent =
+      fastMovers.length === 0 ? 'No fast movers right now' : `${fastMovers.length} fast mover${fastMovers.length===1?'':'s'}`;
+
+    const wrap = document.getElementById('fm-content');
+    if (fastMovers.length === 0) {
+      wrap.innerHTML = `<div class="table-wrap"><div class="empty"><div class="empty-icon">✓</div>Nothing is selling fast enough to trigger the velocity alert.</div></div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="reorder-grid">${fastMovers.map(r => renderReorderCard(r, 'fastmover')).join('')}</div>`;
+  }
+
+  function renderReorderCard(r, kind) {
+    const i = r.item;
+    const rq = Math.ceil(getReorderQty(i, r.stock));
+    const b = getBrand(i.brandId);
+    const sup = getItemSupplier(i);
+    const v = r.velocity;
+    const latest = v.batches[v.batches.length - 1];
+    const reason = getReorderReason(i, r.stock);
+    const accentColor = kind === 'fastmover' ? 'var(--accent)' : 'var(--warn)';
+
+    // Calculate total received and total sold for this item (lifetime)
+    let totalReceived = 0;
+    let totalSold = 0;
+    let firstPurchaseTs = null;  // earliest IN transaction
+    let lastSaleTs = 0;          // latest OUT transaction
+    transactions.forEach(t => {
+      if (t.itemId !== i.id) return;
+      if (t.type === 'In') {
+        totalReceived += Number(t.qty);
+        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+      } else if (t.type === 'Out') {
+        totalSold += Number(t.qty);
+        if (t.ts > lastSaleTs) lastSaleTs = t.ts;
+      }
+    });
+    // Days span: from first purchase to last sale (or today if no sales yet)
+    let daysSpan = 0;
+    if (firstPurchaseTs !== null) {
+      const endTs = lastSaleTs > 0 ? lastSaleTs : Date.now();
+      daysSpan = Math.max(1, Math.round((endTs - firstPurchaseTs) / (24 * 60 * 60 * 1000)));
+    }
+    const soldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
+    // Color code the sold % to give visual feedback
+    let soldPctColor = 'var(--good)';
+    if (soldPct >= 90) soldPctColor = 'var(--bad)';        // urgent — almost gone
+    else if (soldPct >= 75) soldPctColor = 'var(--warn)';  // moving fast
+    else if (soldPct >= 50) soldPctColor = '#f0c83e';      // moderate
+    // else green (selling slow)
+
+    return `
+      <div class="reorder-card ${r.status}" ${kind === 'fastmover' ? 'style="border-left-color: var(--accent);"' : ''}>
+        <div class="reorder-card-head">
+          <div>
+            <div class="reorder-card-name">${escapeHtml(i.name)}</div>
+            <div style="font-size:11px; margin-top:4px;">
+              ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
+              ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
+            </div>
+            <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">${escapeHtml(b?.name || '')} · <span class="sku-tag">${i.id}</span></div>
+          </div>
+          <span class="pill ${r.status}">${statusLabel(r.status)}</span>
+        </div>
+        <div style="background:var(--bg); padding:8px 10px; border-radius:6px; margin-bottom:12px; font-size:12px; border-left:2px solid ${accentColor};">
+          <strong>Why:</strong> ${escapeHtml(reason)}
+          ${latest ? `<div style="font-size:11px; color:var(--text-dim); margin-top:3px;">Last batch: received ${fmt(latest.received)} on ${formatDate(latest.ts)}, sold ${fmt(latest.soldInWindow)} (${Math.round(latest.pct)}%)</div>` : ''}
+        </div>
+        <div class="reorder-card-stats">
+          <div class="stat-block"><div class="stat-label">Current Stock</div><div class="stat-value">${fmt(r.stock, 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">Total Received</div><div class="stat-value">${fmt(totalReceived, 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">Total Sold</div><div class="stat-value" style="color:${soldPctColor};">${fmt(totalSold, 0)} <span style="font-size:11px; opacity:0.8;">(${soldPct}%)</span></div>${daysSpan > 0 && totalSold > 0 ? `<div style="font-size:10px; color:var(--text-dim); margin-top:2px;">in ${daysSpan} day${daysSpan===1?'':'s'}</div>` : ''}</div>
+          <div class="stat-block"><div class="stat-label">Max Level${Number(i.max||0) > 0 ? '' : ' <span style="color:var(--text-dim); font-size:9px;">(auto)</span>'}</div><div class="stat-value">${fmt(getEffectiveMax(i), 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">MOQ${Number(i.moq||0) > 0 ? '' : ' <span style="color:var(--text-dim); font-size:9px;">(auto)</span>'}</div><div class="stat-value">${fmt(getEffectiveMOQ(i), 0)}</div></div>
+          <div class="stat-block"><div class="stat-label">Lead Time</div><div class="stat-value">${getBrandLT(i) > 0 ? getBrandLT(i)+'d' : '<span style="font-size:11px; color:var(--text-dim);">not set</span>'}</div></div>
         </div>
         <div class="reorder-card-cta" ${kind === 'fastmover' ? 'style="background: var(--accent);"' : ''}>
           Order ${fmt(rq, 0)} pieces
