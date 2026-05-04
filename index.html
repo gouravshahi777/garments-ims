@@ -663,7 +663,7 @@
       <span style="color: var(--text-dim); font-size:12px" id="reorder-count"></span>
     </div>
     <div style="font-size:12px; color: var(--text-dim); margin-bottom:14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; border-left: 3px solid var(--warn);">
-      <strong>Regular reorders:</strong> items that are out of stock or below their reorder point. Standard refill quantity.
+      <strong>Reorder List:</strong> items that are out of stock or below their reorder point. Out-of-stock items always show here (urgent). Fast-moving items with healthy stock show in the Fast Movers tab instead.
     </div>
     <div id="reorder-content"></div>
   </div>
@@ -1847,12 +1847,6 @@
       const qtyRaw = norm.totalquantity ?? norm.totalqty ?? norm.saleqty ?? norm.quantity ?? norm.qty ?? norm.units ?? norm.pieces ?? norm.pcs ?? '';
       const qty = parseFloat(String(qtyRaw).replace(/,/g, ''));
 
-      // DEBUG: print first 3 rows so user can see what the parser found
-      if (idx < 3) {
-        console.log(`[DEBUG Row ${idx + headerRowIdx + 2}] All normalized keys:`, Object.keys(norm));
-        console.log(`[DEBUG Row ${idx + headerRowIdx + 2}] qtyRaw="${qtyRaw}", parsed qty=${qty}, lotNumber="${lotNumber}", size="${size}"`);
-      }
-
       // Date: Voucher "Voucher Date", Challan "Ch Date", Sale "Bill Date"
       const date = norm.voucherdate || norm.chdate || norm.billdate || norm.date || '';
 
@@ -2832,20 +2826,30 @@
   // Returns { regular, fastMovers } — regular excludes fast movers so they only show in one tab.
   function getReorderBuckets(supId, brId) {
     const filtered = applyFilters(supId, brId, '');
-    const all = filtered
-      .map(i => {
-        const stock = getStock(i.id);
-        const status = getStatus(i, stock);
-        const v = getVelocityCheck(i.id);
-        return { item: i, stock, status, velocity: v };
-      })
-      .filter(r => ['outofstock','reorder','low'].includes(r.status));
+    const all = filtered.map(i => {
+      const stock = getStock(i.id);
+      const status = getStatus(i, stock);
+      const v = getVelocityCheck(i.id);
+      return { item: i, stock, status, velocity: v };
+    });
 
+    // REORDER LIST: out-of-stock OR below reorder point (regardless of fast-mover status)
+    // Logic: out-of-stock is urgent action; below-ROP is normal refill.
+    // Fast mover items that are ALSO out-of-stock will appear in BOTH tabs (dono actions zaruri hain)
+    // Fast mover items that still have healthy stock will ONLY appear in Fast Movers tab.
+    const regular = all.filter(r => r.status === 'outofstock' || r.status === 'reorder' || r.status === 'low')
+                       .filter(r => {
+                         // If item is fast mover AND has positive stock (just below ROP), exclude from regular
+                         // because Fast Movers tab is the right place for it.
+                         // Out-of-stock items always go in Reorder List.
+                         if (r.velocity.triggered && r.stock > 0) return false;
+                         return true;
+                       });
+
+    // FAST MOVERS: velocity triggered (regardless of stock level)
     const fastMovers = all.filter(r => r.velocity.triggered);
-    const fastMoverIds = new Set(fastMovers.map(r => r.item.id));
-    const regular = all.filter(r => !fastMoverIds.has(r.item.id));
 
-    const order = { outofstock: 0, reorder: 1, low: 2 };
+    const order = { outofstock: 0, reorder: 1, low: 2, healthy: 3, overstock: 4 };
     fastMovers.sort((a, b) => order[a.status] - order[b.status]);
     regular.sort((a, b) => order[a.status] - order[b.status]);
     return { regular, fastMovers };
