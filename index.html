@@ -1862,7 +1862,9 @@
       const qty = parseFloat(String(qtyRaw).replace(/,/g, ''));
 
       // Date: Voucher "Voucher Date", Challan "Ch Date", Sale "Bill Date"
-      const date = norm.voucherdate || norm.chdate || norm.billdate || norm.date || '';
+      // Date priority: BILL DATE pehle (asli maal aane ki date), phir Ch Date (challan), phir Voucher Date (software entry).
+      // Bill Date sabse important hai velocity/reorder calculation ke liye kyunki ye actual receipt date hai.
+      const date = norm.billdate || norm.chdate || norm.voucherdate || norm.date || '';
 
       // Note/Reference: Voucher "Bill No.", Challan "Ch No."
       const note = String(norm.note || norm.remarks || norm.billno || norm.chno || norm.invoice || norm.customer || '').trim();
