@@ -2,18 +2,19 @@
   @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap');
 
   :root {
-    --bg: #0e1116;
-    --panel: #161b22;
-    --panel-2: #1c232c;
-    --border: #2a323d;
-    --text: #e6edf3;
-    --text-dim: #8b949e;
-    --accent: #d4ff3d;
-    --accent-dark: #a8cc2e;
-    --good: #3fb950;
-    --warn: #f0883e;
-    --bad: #f85149;
-    --info: #58a6ff;
+    /* Light gray theme - eye-friendly, professional */
+    --bg: #f6f8fa;          /* soft gray-white background */
+    --panel: #ffffff;        /* white cards */
+    --panel-2: #f0f3f6;      /* slightly darker for table headers, secondary panels */
+    --border: #d0d7de;       /* light gray borders */
+    --text: #24292e;         /* dark gray text (almost black) */
+    --text-dim: #6e7781;     /* medium gray for secondary text */
+    --accent: #2d8f3c;       /* darker green for white bg readability */
+    --accent-dark: #1f6e2c;  /* even darker green for hover */
+    --good: #2ea043;         /* success green */
+    --warn: #d97706;         /* orange (better contrast on white) */
+    --bad: #d1242f;          /* red */
+    --info: #0969da;         /* blue (better contrast on white) */
   }
 
   * { box-sizing: border-box; }
@@ -36,7 +37,7 @@
     width: 38px; height: 38px; background: var(--accent); border-radius: 8px;
     display: grid; place-items: center;
     font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
-    color: #0e1116; font-size: 20px;
+    color: #ffffff; font-size: 20px;
   }
   .brand h1 {
     font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700;
@@ -61,7 +62,7 @@
     font-family: inherit; white-space: nowrap;
   }
   .tab:hover { color: var(--text); }
-  .tab.active { background: var(--accent); color: #0e1116; font-weight: 600; }
+  .tab.active { background: var(--accent); color: #ffffff; font-weight: 600; }
 
   .kpi-row {
     display: grid; grid-template-columns: repeat(5, 1fr);
@@ -104,7 +105,7 @@
   .search-input { flex: 1; min-width: 200px; max-width: 280px; }
 
   .btn {
-    background: var(--accent); color: #0e1116; border: none;
+    background: var(--accent); color: #ffffff; border: none;
     padding: 9px 16px; border-radius: 8px; font-weight: 600;
     font-size: 13px; cursor: pointer; font-family: inherit;
     transition: all 0.15s;
@@ -116,7 +117,7 @@
   .btn-danger:hover { background: var(--bad); color: white; }
   .btn-sm { padding: 5px 10px; font-size: 11px; }
   .btn-good { background: var(--good); color: white; }
-  .btn-good:hover { background: #2ea043; }
+  .btn-good:hover { background: #1a7f3a; }
 
   .table-wrap {
     background: var(--panel); border: 1px solid var(--border);
@@ -132,7 +133,7 @@
   thead th.num, tbody td.num { text-align: right; font-family: 'Geist Mono', monospace; }
   tbody td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
   tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover { background: rgba(212, 255, 61, 0.04); }
+  tbody tr:hover { background: rgba(45, 143, 60, 0.06); }
   .sku-tag {
     font-family: 'Geist Mono', monospace; font-size: 11px;
     background: var(--panel-2); padding: 2px 7px; border-radius: 4px;
@@ -144,7 +145,7 @@
     background: rgba(88, 166, 255, 0.12); color: var(--info);
     margin-right: 4px;
   }
-  .color-tag { background: rgba(212, 255, 61, 0.12); color: var(--accent); }
+  .color-tag { background: rgba(45, 143, 60, 0.12); color: var(--accent); }
 
   .pill {
     display: inline-block; padding: 3px 10px; border-radius: 100px;
@@ -152,7 +153,7 @@
   }
   .pill.outofstock { background: rgba(248, 81, 73, 0.15); color: var(--bad); }
   .pill.reorder { background: rgba(240, 136, 62, 0.15); color: var(--warn); }
-  .pill.low { background: rgba(240, 200, 62, 0.15); color: #f0c83e; }
+  .pill.low { background: rgba(217, 119, 6, 0.15); color: #b45309; }
   .pill.healthy { background: rgba(63, 185, 80, 0.15); color: var(--good); }
   .pill.overstock { background: rgba(88, 166, 255, 0.15); color: var(--info); }
 
@@ -167,7 +168,7 @@
   .empty-icon { font-size: 36px; margin-bottom: 12px; }
 
   .modal-overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    position: fixed; inset: 0; background: rgba(0,0,0,0.4);
     backdrop-filter: blur(4px); display: none;
     align-items: center; justify-content: center; z-index: 100;
     padding: 20px;
@@ -216,7 +217,7 @@
     background: var(--panel); border: 1px solid var(--border);
     border-left: 3px solid var(--accent); padding: 12px 18px;
     border-radius: 8px; font-size: 13px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.12);
     transform: translateX(120%); transition: transform 0.3s;
     z-index: 200;
   }
@@ -255,7 +256,7 @@
   }
   .reorder-card-cta {
     margin-top: 14px; padding: 10px; background: var(--accent);
-    color: #0e1116; border-radius: 7px; text-align: center;
+    color: #ffffff; border-radius: 7px; text-align: center;
     font-weight: 600; font-size: 13px;
   }
   .supplier-line {
@@ -334,7 +335,7 @@
   }
   .drop-zone:hover, .drop-zone.dragover {
     border-color: var(--accent);
-    background: rgba(212, 255, 61, 0.04);
+    background: rgba(45, 143, 60, 0.06);
   }
   .drop-zone-icon {
     font-size: 36px;
@@ -443,10 +444,10 @@
 </style>
 
 <!-- ============== LOGIN SCREEN ============== -->
-<div id="login-screen" style="position:fixed; inset:0; background: linear-gradient(135deg, #0e1116 0%, #1c232c 100%); z-index: 9999; display: none; align-items: center; justify-content: center; padding: 20px; font-family: 'Geist', sans-serif;">
-  <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 40px 32px; max-width: 420px; width: 100%; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+<div id="login-screen" style="position:fixed; inset:0; background: linear-gradient(135deg, #f6f8fa 0%, #e1e4e8 100%); z-index: 9999; display: none; align-items: center; justify-content: center; padding: 20px; font-family: 'Geist', sans-serif;">
+  <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 40px 32px; max-width: 420px; width: 100%; box-shadow: 0 20px 50px rgba(0,0,0,0.15);">
     <div style="text-align:center;">
-      <div style="width: 70px; height: 70px; background: var(--accent); border-radius: 14px; margin: 0 auto 22px; display: grid; place-items: center; font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: #0e1116; font-size: 32px;">RG</div>
+      <div style="width: 70px; height: 70px; background: var(--accent); border-radius: 14px; margin: 0 auto 22px; display: grid; place-items: center; font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; color: #ffffff; font-size: 32px;">RG</div>
       <h1 style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.02em;">Retail Garments IMS</h1>
       <p style="color: var(--text-dim); font-size: 13px; margin: 0 0 28px;">Username aur password se sign in karo</p>
     </div>
@@ -461,7 +462,7 @@
       <input type="password" id="login-password" placeholder="••••••••" autocomplete="current-password" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 11px 13px; border-radius: 8px; font-size: 14px; font-family: inherit; outline: none;" onkeydown="if(event.key==='Enter') signInWithUsername()" />
     </div>
 
-    <button id="login-btn" onclick="signInWithUsername()" style="width: 100%; background: var(--accent); color: #0e1116; border: none; padding: 12px 20px; border-radius: 10px; font-weight: 700; font-size: 14px; cursor: pointer; font-family: inherit; transition: all 0.15s;">
+    <button id="login-btn" onclick="signInWithUsername()" style="width: 100%; background: var(--accent); color: #ffffff; border: none; padding: 12px 20px; border-radius: 10px; font-weight: 700; font-size: 14px; cursor: pointer; font-family: inherit; transition: all 0.15s;">
       Sign In
     </button>
 
@@ -1203,7 +1204,7 @@
     if (!overlay) {
       overlay = document.createElement('div');
       overlay.id = 'fb-loading-overlay';
-      overlay.style.cssText = 'position:fixed; inset:0; background:rgba(14,17,22,0.95); display:flex; align-items:center; justify-content:center; z-index:1000; flex-direction:column; gap:14px; font-family: Geist, sans-serif;';
+      overlay.style.cssText = 'position:fixed; inset:0; background:rgba(246,248,250,0.95); display:flex; align-items:center; justify-content:center; z-index:1000; flex-direction:column; gap:14px; font-family: Geist, sans-serif;';
       overlay.innerHTML = `
         <div style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 24px; color: var(--accent); font-weight:700;">☁️ ${msg}</div>
         <div style="color: var(--text-dim); font-size: 13px;">Cloud se sync ho raha hai...</div>
@@ -1229,7 +1230,7 @@
     }
 
     const roleColors = {
-      admin:   { bg: 'rgba(212,255,61,0.15)',   color: 'var(--accent)' },
+      admin:   { bg: 'rgba(45,143,60,0.12)',   color: 'var(--accent)' },
       manager: { bg: 'rgba(88,166,255,0.15)',   color: 'var(--info)' },
       staff:   { bg: 'rgba(139,148,158,0.15)',  color: 'var(--text-dim)' }
     };
@@ -1477,7 +1478,7 @@
     if (badgeEl && currentUserRole) {
       badgeEl.textContent = currentUserRole;
       const colors = {
-        admin:   { bg: 'rgba(212,255,61,0.2)',   color: 'var(--accent)' },
+        admin:   { bg: 'rgba(45,143,60,0.18)',   color: 'var(--accent)' },
         manager: { bg: 'rgba(88,166,255,0.2)',   color: 'var(--info)' },
         staff:   { bg: 'rgba(139,148,158,0.2)',  color: 'var(--text-dim)' }
       };
@@ -2014,10 +2015,63 @@
               startStock: 0
             });
           }
+        } else if (uploadType === 'Out' && derivedFromColumns) {
+          // Sale for an SKU we don't have purchase data for — auto-create the SKU.
+          // We DON'T add stock IN here — instead, we'll calculate proper opening stock
+          // at confirmUpload time based on TOTAL sale quantity (so stock won't go negative).
+          action = 'create_new_from_sale';
+
+          // Track supplier (use Agent Name as proxy — for sale files there's no party,
+          // so we'll use a generic "OPENING STOCK" supplier)
+          const partyForSale = partyName || 'OPENING STOCK';
+          let supplierId = null;
+          const existing = suppliers.find(s => s.name.toLowerCase() === partyForSale.toLowerCase());
+          if (existing) {
+            supplierId = existing.id;
+          } else if (newSuppliers.has(partyForSale.toLowerCase())) {
+            supplierId = newSuppliers.get(partyForSale.toLowerCase()).id;
+          } else {
+            const id = 's' + (Date.now() + newSuppliers.size).toString(36);
+            newSuppliers.set(partyForSale.toLowerCase(), { id, name: partyForSale });
+            supplierId = id;
+          }
+
+          // Track brand (use Company Name from sale file, or fallback)
+          const brandName = companyName || partyForSale || 'Unknown';
+          let brandId = null;
+          const brandKey = brandName.toLowerCase();
+          const existingBrand = brands.find(b => b.name.toLowerCase() === brandKey);
+          if (existingBrand) {
+            brandId = existingBrand.id;
+          } else if (newBrands.has(brandKey)) {
+            brandId = newBrands.get(brandKey).id;
+          } else {
+            const id = 'b' + (Date.now() + newBrands.size + 10000).toString(36);
+            newBrands.set(brandKey, { id, name: brandName, supplierId });
+            brandId = id;
+          }
+
+          // Track SKU draft (opening stock will be calculated at confirmUpload from total sales)
+          if (!newSkus.has(skuCode)) {
+            newSkus.set(skuCode, {
+              id: skuCode,
+              name: itemName || 'Unnamed',
+              brandId,
+              category: groupName,
+              size,
+              color: shade,
+              cost: 0,
+              sell: rate,
+              adc: 0,
+              moq: 0,
+              max: 0,
+              startStock: 0  // will be set at confirmUpload from total sale qty for this SKU
+            });
+          }
         } else if (uploadType === 'Out') {
-          // Sales for an SKU we don't have — skip
+          // Sale row but no Lot Number column → can't identify item
           valid = false;
-          reason = 'SKU not found (sales need existing SKUs)';
+          reason = 'Cannot identify item — need a Lot Number column';
         } else {
           valid = false;
           reason = 'Cannot identify item — need a Lot Number column or SKU Code';
@@ -2146,7 +2200,9 @@
             } else if (r.isReturn) {
               statusBadge = `<span class="row-status" style="background: rgba(88,166,255,0.15); color: var(--info);">↩ Return → Stock IN</span>`;
             } else if (r.action === 'create_new') {
-              statusBadge = `<span class="row-status" style="background: rgba(212,255,61,0.15); color: var(--accent);">Create + Import</span>`;
+              statusBadge = `<span class="row-status" style="background: rgba(45,143,60,0.12); color: var(--accent);">Create + Import</span>`;
+            } else if (r.action === 'create_new_from_sale') {
+              statusBadge = `<span class="row-status" style="background: rgba(217,119,6,0.15); color: #b45309;">New SKU (from sale)</span>`;
             } else {
               statusBadge = `<span class="row-status ok">Will import</span>`;
             }
@@ -2230,8 +2286,34 @@
     pendingNewBrands.forEach(b => {
       if (!brands.find(x => x.id === b.id)) brands.push({ ...b });
     });
+
+    // Smart Opening Stock for auto-created SKUs from SALE uploads:
+    // For each new SKU created from sale data, sum all sale rows for that SKU and
+    // set startStock = total sold (so final stock = startStock - sold = 0, not negative).
+    // This handles the case where the shop had pre-existing stock before our records start.
+    const skuTotalSale = new Map(); // skuCode → total qty sold (after returns)
+    if (uploadType === 'Out') {
+      valid.forEach(r => {
+        const sku = r.sku;
+        if (!sku) return;
+        const cur = skuTotalSale.get(sku) || 0;
+        // Returns add stock back, regular sales subtract stock
+        const change = r.isReturn ? -r.qty : r.qty;
+        skuTotalSale.set(sku, cur + change);
+      });
+    }
+
     pendingNewSkus.forEach(sk => {
-      if (!items.find(x => x.id === sk.id)) items.push({ ...sk });
+      if (!items.find(x => x.id === sk.id)) {
+        // For SKUs created from sale data (action='create_new_from_sale'),
+        // set opening stock = total qty being sold so final stock won't go negative.
+        const totalSold = skuTotalSale.get(sk.id) || 0;
+        if (totalSold > 0 && uploadType === 'Out') {
+          // This SKU was created from sale data — set opening stock = total sold
+          sk.startStock = totalSold;
+        }
+        items.push({ ...sk });
+      }
     });
 
     // Re-resolve items for rows that needed creation
@@ -3296,7 +3378,7 @@
     let soldPctColor = 'var(--good)';
     if (soldPct >= 90) soldPctColor = 'var(--bad)';        // urgent — almost gone
     else if (soldPct >= 75) soldPctColor = 'var(--warn)';  // moving fast
-    else if (soldPct >= 50) soldPctColor = '#f0c83e';      // moderate
+    else if (soldPct >= 50) soldPctColor = '#b45309';      // moderate
     // else green (selling slow)
 
     return `
