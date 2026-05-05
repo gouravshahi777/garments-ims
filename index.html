@@ -3155,9 +3155,19 @@
     }
     const itemTx = txByItemCache.get(itemId) || [];
 
+    // MIN BATCH SIZE: ignore tiny "In" transactions (likely customer returns).
+    // Real purchase batches are usually 10+ pcs in garments retail.
+    // This prevents false "fast mover" flags from a 2-3 pc return showing 100% sold.
+    const MIN_BATCH_SIZE = 10;
+
     const batches = [];
     itemTx.forEach(tx => {
       if (tx.type !== 'In') return;
+      // Skip tiny In transactions — they're returns, not real purchase batches
+      if (Number(tx.qty) < MIN_BATCH_SIZE) return;
+      // Skip explicit returns (tagged with [RETURN])
+      if (tx.note && (tx.note.includes('[RETURN]') || tx.note === 'RETURN' || tx.note.endsWith(' RETURN'))) return;
+
       const batchEnd = tx.ts + windowMs;
       // Sum OUT transactions within the window after this batch
       const soldInWindow = itemTx
