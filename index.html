@@ -754,23 +754,6 @@
 
   <div id="tab-settings" class="tab-content" style="display:none">
     <div class="setting-card">
-      <h3>📊 Excel upload format</h3>
-      <p>
-        Both Purchase (Stock IN) and Sales (Stock OUT) sheets use the same format. The first row should be column headers; the rest are your transactions.
-      </p>
-      <p style="font-size:12px;">
-        <strong>Required columns:</strong> <code>SKU Code</code> and <code>Quantity</code>.<br>
-        <strong>Optional columns:</strong> <code>Date</code>, <code>Note</code> (bill no, customer name, etc).<br>
-        Column order doesn't matter — match by name. SKU codes that don't exist in the system will be skipped (you'll see them in the preview).
-      </p>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top: 8px;">
-        <button class="btn btn-ghost" onclick="downloadTemplate('In')">↓ Purchase Template (.csv)</button>
-        <button class="btn btn-ghost" onclick="downloadTemplate('Out')">↓ Sale Template (.csv)</button>
-        <button class="btn btn-ghost" onclick="downloadSKUList()">↓ Current SKU Codes (.csv)</button>
-      </div>
-    </div>
-
-    <div class="setting-card">
       <h3>⚡ Reorder Trigger — Sales Velocity</h3>
       <p>
         A SKU is flagged for reorder when <strong>X% or more of a received batch sells within Y days</strong>.
@@ -799,22 +782,6 @@
       <p style="font-size:11px; color: var(--text-dim); margin-top:14px;">
         <strong>Current rule (20 days / 75% / 2× boost):</strong> Received 4 pcs, sold 3 within 20 days → flagged as fast mover.
         Next order will be 4 × 2 = <strong>8 pcs</strong>. Slow-moving items still order at normal refill quantity.
-      </p>
-    </div>
-
-    <div class="setting-card">
-      <h3>How reorder works</h3>
-      <p>
-        A SKU appears on the <strong>Reorder List</strong> if any of these are true:<br>
-        1. <strong>Out of stock</strong> (current stock ≤ 0)<br>
-        2. <strong>Sales velocity trigger</strong> — fast sell-through on the latest batch (settings above)<br>
-        3. <strong>Below reorder point</strong> — stock ≤ Daily Sales × Lead Time × Safety Factor (uses supplier's LT and SF)
-      </p>
-      <p style="font-size:12px;">
-        <strong>Suggested Order Qty:</strong><br>
-        • Normal items: max(MOQ, Max Level − Current Stock)<br>
-        • Fast movers (velocity-triggered): last batch × multiplier (e.g. received 4 pcs → order 8)<br>
-        <strong>Lead Time and Safety Factor</strong> are set per <strong>Supplier</strong> (one place, applies to all SKUs from that supplier).
       </p>
     </div>
 
@@ -885,38 +852,22 @@
       </p>
     </div>
 
-    <div class="setting-card" style="border-left: 3px solid var(--info);">
-      <h3>🔧 Fix Negative Stock</h3>
+    <div class="setting-card" style="border-left: 3px solid var(--bad);">
+      <h3>🔄 Quick Reset & Re-upload Guide</h3>
       <p>
-        Agar Live Stock mein kuch items <strong style="color: var(--bad);">minus (-)</strong> mein dikh rahe hain, ye button click karo.
+        Agar aapke numbers galat dikh rahe hain (Total Returns 0 ya stock galat), is button se clean reset karo. Pure data delete karke aap fresh upload kar sakte ho — naya code returns properly tag karta hai.
       </p>
       <p style="font-size: 12px;">
-        <strong>Reason:</strong> Aapke billing software mein purane purchase records nahi hain (Feb 2026 se pehle ka data missing hai), lekin sale mein wo purane lots ki sale aaye hain.
-        <br><br>
-        <strong>Ye button kya karega:</strong> Sabhi negative stock items ka <strong>opening stock auto-add</strong> kar dega, taki final stock = 0 ho jaye. Ye one-time fix hai aur safe hai.
+        <strong>Ye button kya karega:</strong><br>
+        1. Saara purana data delete karega<br>
+        2. Aapko exact steps batayega kya upload karna hai<br>
+        3. Sale file mein returns automatically tag honge ([RETURN])<br>
+        4. Stock numbers correct dikhayenge
       </p>
-      <button class="btn btn-good" onclick="fixNegativeStock()">🔧 Fix All Negative Stock</button>
-    </div>
-
-    <div class="setting-card" style="border-left: 3px solid var(--warn);">
-      <h3>↩ Tag Returns in Old Data</h3>
-      <p>
-        Agar Live Stock mein <strong>"Total Returns: 0"</strong> dikh raha hai (lekin actual returns hone chahiye), ye button click karo.
+      <p style="font-size: 11px; color: var(--bad); font-weight: 600;">
+        ⚠️ WARNING: Saara data delete ho jayega! Pehle "Download Backup" button click karke backup le lo (upar wala section).
       </p>
-      <p style="font-size: 12px;">
-        <strong>Reason:</strong> Purana code returns ko alag tag nahi karta tha. Naya code <code>[RETURN]</code> tag laga deta hai. Lekin pehle se save data mein ye tag nahi hai.
-        <br><br>
-        <strong>Ye button kya karega:</strong> Saare "Stock IN" transactions check karega — agar uski qty kisi same-date "Stock OUT" transaction se match kare (cancel pattern), toh use return mark kar dega.
-        <br><br>
-        ⚠️ <strong>Safe hai</strong> — sirf note mein tag add hoga, qty/stock change nahi hoga.
-      </p>
-      <button class="btn btn-good" onclick="tagReturnsInOldData()">↩ Tag Returns in Old Data</button>
-    </div>
-
-    <div class="setting-card">
-      <h3>Sample data</h3>
-      <p>Loaded with 2 suppliers, 4 brands, and 12 sample SKUs across sizes & colors.</p>
-      <button class="btn btn-ghost" onclick="loadSampleData()">Reset to sample data</button>
+      <button class="btn btn-danger" onclick="resetAndGuide()">🔄 Reset & Show Re-upload Guide</button>
     </div>
 
     <div class="setting-card">
@@ -1768,7 +1719,118 @@
     }
   }
 
-  // Tag returns in old data — for users who uploaded sales BEFORE the [RETURN] tag logic existed.
+  // QUICK RESET & GUIDE — for users with messy data who want a fresh start.
+  // Deletes all data and shows a step-by-step popup with re-upload instructions.
+  async function resetAndGuide() {
+    if (!canEdit()) {
+      alert('Sirf Admin/Manager ye kar sakte hain.');
+      return;
+    }
+
+    const msg1 = `⚠️ CONFIRM: Saara data delete karna hai?\n\n` +
+                 `Ye delete hoga:\n` +
+                 `• ${suppliers.length} suppliers\n` +
+                 `• ${brands.length} brands\n` +
+                 `• ${items.length} SKUs\n` +
+                 `• ${transactions.length} transactions\n\n` +
+                 `Continue?`;
+    if (!confirm(msg1)) return;
+
+    const msg2 = `Last warning! Aapne backup le liya hai?\n\n` +
+                 `Settings > Backup & Restore > Download Backup\n\n` +
+                 `Click OK to DELETE EVERYTHING.`;
+    if (!confirm(msg2)) return;
+
+    // Delete all data
+    showLoadingOverlay('Deleting all data...');
+    suppliers = [];
+    brands = [];
+    items = [];
+    transactions = [];
+    settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+    await saveAll();
+    hideLoadingOverlay();
+
+    if (!lastSaveOk) {
+      alert('⚠️ Delete failed! Internet check karo aur try again.');
+      return;
+    }
+
+    bumpDataVersion();
+    renderAll();
+
+    // Now show the step-by-step guide
+    showResetGuideModal();
+  }
+
+  function showResetGuideModal() {
+    // Create custom modal with step-by-step guide
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:500; display:flex; align-items:center; justify-content:center; padding:20px;';
+    overlay.innerHTML = `
+      <div style="background:var(--panel); border:1px solid var(--border); border-radius:14px; max-width:600px; width:100%; max-height:90vh; overflow-y:auto; padding:28px;">
+        <h2 style="font-family:'Bricolage Grotesque',sans-serif; font-size:22px; margin:0 0 8px; color:var(--accent);">✓ Data deleted!</h2>
+        <p style="color:var(--text-dim); margin:0 0 20px; font-size:13px;">Ab in 4 files ko UPAR wale buttons se upload karo IS ORDER mein:</p>
+
+        <div style="background:var(--bg); border-radius:10px; padding:16px; margin-bottom:14px; border-left:3px solid var(--good);">
+          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Step 1: 📥 Purchase Voucher</div>
+          <div style="font-size:12px; color:var(--text-dim); line-height:1.6;">
+            Top mein <strong>"📥 Purchase Voucher"</strong> button click karo<br>
+            File: <code style="background:var(--panel-2); padding:2px 6px; border-radius:4px;">purchase_report_0102to0305__2_.xlsx</code><br>
+            ⏳ Wait for "Imported X rows" toast<br>
+            Expected: ~9,204 rows
+          </div>
+        </div>
+
+        <div style="background:var(--bg); border-radius:10px; padding:16px; margin-bottom:14px; border-left:3px solid var(--good);">
+          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Step 2: 📥 Purchase Challan (Feb-Mar)</div>
+          <div style="font-size:12px; color:var(--text-dim); line-height:1.6;">
+            Top mein <strong>"📥 Purchase Challan"</strong> button click karo<br>
+            File: <code style="background:var(--panel-2); padding:2px 6px; border-radius:4px;">challan_report_0102to3103.xlsx</code><br>
+            Expected: ~946 rows
+          </div>
+        </div>
+
+        <div style="background:var(--bg); border-radius:10px; padding:16px; margin-bottom:14px; border-left:3px solid var(--good);">
+          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Step 3: 📥 Purchase Challan (Apr-May)</div>
+          <div style="font-size:12px; color:var(--text-dim); line-height:1.6;">
+            Top mein <strong>"📥 Purchase Challan"</strong> button click karo (firse)<br>
+            File: <code style="background:var(--panel-2); padding:2px 6px; border-radius:4px;">CHALLAN_REPORT_0104TO0305.xlsx</code><br>
+            Expected: ~614 rows
+          </div>
+        </div>
+
+        <div style="background:rgba(248,81,73,0.08); border-radius:10px; padding:16px; margin-bottom:14px; border-left:3px solid var(--bad);">
+          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Step 4: 📤 Upload Sale (BIG! - go slow)</div>
+          <div style="font-size:12px; color:var(--text-dim); line-height:1.6;">
+            Top mein <strong>"📤 Upload Sale"</strong> button click karo<br>
+            File: <code style="background:var(--panel-2); padding:2px 6px; border-radius:4px;">sale_report_0102to0305.xlsx</code><br>
+            <strong style="color:var(--bad);">⚠️ IMPORTANT:</strong> 46K+ rows hai - 30-60 sec wait karo!<br>
+            Preview mein dikhega: "5,632 return rows detected" - perfect ✅<br>
+            "Confirm Import (46804)" click karo<br>
+            <strong>Tab close mat karo, browser refresh mat karo!</strong>
+          </div>
+        </div>
+
+        <div style="background:rgba(45,143,60,0.08); border-radius:10px; padding:16px; margin-bottom:20px; border-left:3px solid var(--accent);">
+          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">✅ Expected Final Numbers:</div>
+          <div style="font-size:12px; color:var(--text); line-height:1.7;">
+            • Total Received: <strong>~62,322</strong><br>
+            • Total Stock: <strong>~23,389</strong> (correct!)<br>
+            • Total Sold: <strong>~44,798</strong><br>
+            • Total Returns: <strong>~5,867</strong> ✅<br>
+            • Sold %: <strong>~72%</strong>
+          </div>
+        </div>
+
+        <div style="display:flex; justify-content:flex-end;">
+          <button class="btn" onclick="this.closest('div[style*=position]').remove()" style="background:var(--accent);">Got it - start uploading</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+  }
+
   // SMART DETECTION: tries multiple strategies to identify returns
   //
   // Strategy 1: An "In" transaction with same itemId+note as an "Out" transaction (matching bill no)
