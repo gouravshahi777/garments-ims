@@ -2909,36 +2909,20 @@
     });
 
     // Build a per-item summary of received/sold/returns from transactions
-    // Uses SAME smart auto-detection as Live Stock KPIs (no [RETURN] tag needed)
+    // Uses [RETURN] tag for detection (set during fresh sale uploads)
     const txSummary = new Map(); // itemId → {received, sold, returns}
-
-    // Pre-classify items: which have purchase batches (any In ≥ 10)?
-    const itemHasPurchase = new Map();
-    transactions.forEach(t => {
-      if (t.type === 'In' && Number(t.qty) >= 10) {
-        itemHasPurchase.set(t.itemId, true);
-      }
-    });
-
     transactions.forEach(t => {
       let s = txSummary.get(t.itemId);
       if (!s) {
         s = { received: 0, sold: 0, returns: 0 };
         txSummary.set(t.itemId, s);
       }
-      const explicitReturn = t.note && t.note.includes('[RETURN]');
+      const isReturn = t.note && t.note.includes('[RETURN]');
       if (t.type === 'In') {
-        const qty = Number(t.qty);
-        const hasPurchaseBatch = itemHasPurchase.has(t.itemId);
-        let isReturn = false;
-        if (explicitReturn) isReturn = true;
-        else if (!hasPurchaseBatch) isReturn = true;
-        else if (qty <= 5) isReturn = true;
-
-        if (isReturn) s.returns += qty;
-        else s.received += qty;
+        if (isReturn) s.returns += Number(t.qty);
+        else s.received += Number(t.qty);
       } else if (t.type === 'Out') {
-        if (explicitReturn) s.received -= Number(t.qty);
+        if (isReturn) s.received -= Number(t.qty);
         else s.sold += Number(t.qty);
       }
     });
@@ -3410,12 +3394,8 @@
       `${filtered.length} of ${items.length} item${items.length === 1 ? '' : 's'}`;
 
     // ============== UPDATE KPIs (based on current Supplier/Brand filter) ==============
-    // SMART AUTO-DETECTION: detects returns from saved data without needing [RETURN] tags.
-    // For each item, classifies "In" transactions as either Purchase or Return:
-    //   - Has [RETURN] tag → Return (explicit, from new uploads)
-    //   - Item has NO purchase batch (sale-only SKU) → ALL Ins are returns
-    //   - Has purchase batch (≥10 qty) AND this In has small qty (≤5) → Return
-    //   - Otherwise → Purchase
+    // Returns are detected ONLY by [RETURN] tag in note (set during fresh sale upload).
+    // Old data without tags will show Returns = 0; user needs to re-upload sale file.
     const visibleItemIds = new Set(visible.map(i => i.id));
     let lsTotalStock = 0;
     let lsTotalReceived = 0;
@@ -3426,41 +3406,17 @@
       lsTotalStock += getStock(i.id);
     });
 
-    // Pre-classify each item: does it have a purchase batch? (any In ≥ 10)
-    // Used to detect sale-only SKUs (where ALL Ins are returns).
-    const itemHasPurchase = new Map();
-    transactions.forEach(t => {
-      if (t.type === 'In' && Number(t.qty) >= 10) {
-        itemHasPurchase.set(t.itemId, true);
-      }
-    });
-
     transactions.forEach(t => {
       if (!visibleItemIds.has(t.itemId)) return;
-      const explicitReturn = t.note && t.note.includes('[RETURN]');
-
+      const isReturn = t.note && t.note.includes('[RETURN]');
       if (t.type === 'In') {
-        const qty = Number(t.qty);
-        const hasPurchaseBatch = itemHasPurchase.has(t.itemId);
-
-        let isReturn = false;
-        if (explicitReturn) {
-          isReturn = true;
-        } else if (!hasPurchaseBatch) {
-          // Sale-only SKU — all Ins are customer returns
-          isReturn = true;
-        } else if (qty <= 5) {
-          // Has purchase batch + small In qty = likely return
-          isReturn = true;
-        }
-
         if (isReturn) {
-          lsTotalReturns += qty;
+          lsTotalReturns += Number(t.qty);
         } else {
-          lsTotalReceived += qty;
+          lsTotalReceived += Number(t.qty);
         }
       } else if (t.type === 'Out') {
-        if (explicitReturn) {
+        if (isReturn) {
           lsTotalReceived -= Number(t.qty);
         } else {
           lsTotalSold += Number(t.qty);
