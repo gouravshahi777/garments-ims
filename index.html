@@ -898,6 +898,21 @@
       <button class="btn btn-good" onclick="fixNegativeStock()">🔧 Fix All Negative Stock</button>
     </div>
 
+    <div class="setting-card" style="border-left: 3px solid var(--warn);">
+      <h3>↩ Tag Returns in Old Data</h3>
+      <p>
+        Agar Live Stock mein <strong>"Total Returns: 0"</strong> dikh raha hai (lekin actual returns hone chahiye), ye button click karo.
+      </p>
+      <p style="font-size: 12px;">
+        <strong>Reason:</strong> Purana code returns ko alag tag nahi karta tha. Naya code <code>[RETURN]</code> tag laga deta hai. Lekin pehle se save data mein ye tag nahi hai.
+        <br><br>
+        <strong>Ye button kya karega:</strong> Saare "Stock IN" transactions check karega — agar uski qty kisi same-date "Stock OUT" transaction se match kare (cancel pattern), toh use return mark kar dega.
+        <br><br>
+        ⚠️ <strong>Safe hai</strong> — sirf note mein tag add hoga, qty/stock change nahi hoga.
+      </p>
+      <button class="btn btn-good" onclick="tagReturnsInOldData()">↩ Tag Returns in Old Data</button>
+    </div>
+
     <div class="setting-card">
       <h3>Sample data</h3>
       <p>Loaded with 2 suppliers, 4 brands, and 12 sample SKUs across sizes & colors.</p>
@@ -1749,6 +1764,73 @@
       });
       bumpDataVersion();
       alert('⚠️ Fix save nahi hua. Internet check karo aur dobara try karo.');
+      renderAll();
+    }
+  }
+
+  // Tag returns in old data — for users who uploaded sales BEFORE the [RETURN] tag logic existed.
+  // Detection logic: an "In" transaction is a return if there's an "Out" transaction
+  // with the SAME itemId AND SAME note (bill number). When a customer returns a piece,
+  // both the original sale and the return share the same bill number.
+  async function tagReturnsInOldData() {
+    if (!canEdit()) {
+      alert('Sirf Admin/Manager ye kar sakte hain.');
+      return;
+    }
+
+    // Build a set of (itemId | note) keys for all OUT transactions
+    const outKeys = new Set();
+    transactions.forEach(t => {
+      if (t.type === 'Out' && t.note) {
+        outKeys.add(t.itemId + '|' + t.note.trim());
+      }
+    });
+
+    // Find "In" transactions that match an Out (same itemId + same note) and don't already have [RETURN] tag
+    let candidates = [];
+    transactions.forEach(t => {
+      if (t.type !== 'In') return;
+      if (!t.note) return;
+      const noteClean = t.note.trim();
+      if (noteClean.includes('[RETURN]')) return; // already tagged
+      const key = t.itemId + '|' + noteClean;
+      if (outKeys.has(key)) {
+        candidates.push(t);
+      }
+    });
+
+    if (candidates.length === 0) {
+      alert('✓ No untagged returns found.\n\nEither:\n• All returns are already tagged\n• Or your data has no returns');
+      return;
+    }
+
+    const totalReturnQty = candidates.reduce((s, t) => s + Number(t.qty), 0);
+    const msg = `Detected ${candidates.length} return transactions (${totalReturnQty} pcs total).\n\n` +
+                `These will be tagged with [RETURN] so they show up correctly in the "Total Returns" KPI.\n\n` +
+                `✅ Stock numbers will NOT change — only the labels.\n\n` +
+                `Continue?`;
+    if (!confirm(msg)) return;
+
+    // Apply tags
+    showLoadingOverlay('Tagging returns...');
+    candidates.forEach(t => {
+      t.note = (t.note || '').trim() + ' [RETURN]';
+    });
+
+    await saveAll();
+    hideLoadingOverlay();
+
+    if (lastSaveOk) {
+      bumpDataVersion();
+      renderAll();
+      switchTab('livestock');
+      toast(`✓ Tagged ${candidates.length} returns (${totalReturnQty} pcs)`);
+    } else {
+      // Rollback on save failure — remove the tag we just added
+      candidates.forEach(t => {
+        t.note = (t.note || '').replace(/ \[RETURN\]$/, '');
+      });
+      alert('⚠️ Save failed. Internet check karo aur dobara try karo.');
       renderAll();
     }
   }
