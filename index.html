@@ -1769,16 +1769,35 @@
   }
 
   // Tag returns in old data — for users who uploaded sales BEFORE the [RETURN] tag logic existed.
-  // Detection logic: an "In" transaction is a return if there's an "Out" transaction
-  // with the SAME itemId AND SAME note (bill number). When a customer returns a piece,
-  // both the original sale and the return share the same bill number.
+  // SMART DETECTION: tries multiple strategies to identify returns
+  //
+  // Strategy 1: An "In" transaction with same itemId+note as an "Out" transaction (matching bill no)
+  // Strategy 2: For SKUs where an "In" transaction has small qty (≤5) AND there's a larger purchase
+  //             in same data — small In is likely a customer return
+  // Strategy 3: Time-based — if In comes AFTER substantial sales, it's likely a return
   async function tagReturnsInOldData() {
     if (!canEdit()) {
       alert('Sirf Admin/Manager ye kar sakte hain.');
       return;
     }
 
-    // Build a set of (itemId | note) keys for all OUT transactions
+    // Build per-item transaction summary
+    const itemStats = new Map(); // itemId → { ins: [...], outs: [...], totalIn, totalOut }
+    transactions.forEach(t => {
+      if (!itemStats.has(t.itemId)) {
+        itemStats.set(t.itemId, { ins: [], outs: [], totalIn: 0, totalOut: 0 });
+      }
+      const s = itemStats.get(t.itemId);
+      if (t.type === 'In') {
+        s.ins.push(t);
+        s.totalIn += Number(t.qty);
+      } else {
+        s.outs.push(t);
+        s.totalOut += Number(t.qty);
+      }
+    });
+
+    // STRATEGY 1: Bill number matching (existing logic)
     const outKeys = new Set();
     transactions.forEach(t => {
       if (t.type === 'Out' && t.note) {
@@ -1786,34 +1805,77 @@
       }
     });
 
-    // Find "In" transactions that match an Out (same itemId + same note) and don't already have [RETURN] tag
-    let candidates = [];
+    let candidates = new Set();
+
     transactions.forEach(t => {
       if (t.type !== 'In') return;
       if (!t.note) return;
       const noteClean = t.note.trim();
-      if (noteClean.includes('[RETURN]')) return; // already tagged
+      if (noteClean.includes('[RETURN]')) return;
       const key = t.itemId + '|' + noteClean;
       if (outKeys.has(key)) {
-        candidates.push(t);
+        candidates.add(t);
       }
     });
 
-    if (candidates.length === 0) {
-      alert('✓ No untagged returns found.\n\nEither:\n• All returns are already tagged\n• Or your data has no returns');
+    // STRATEGY 2: Small-qty heuristic for SKUs that have a clear "main batch" pattern
+    // For each item, find the LARGEST In transaction (the purchase batch).
+    // Any OTHER In with qty significantly smaller (≤ 1/3 of main batch, or ≤ 5 pcs) = likely return.
+    itemStats.forEach((stats, itemId) => {
+      if (stats.ins.length < 2) return; // need at least 2 In transactions to detect pattern
+      // Sort ins by qty desc — largest first
+      const sortedIns = stats.ins.slice().sort((a, b) => Number(b.qty) - Number(a.qty));
+      const largest = Number(sortedIns[0].qty);
+      // If largest is at least 10, others with qty ≤ 5 OR ≤ largest/3 are likely returns
+      if (largest < 10) return;
+      const threshold = Math.min(5, Math.floor(largest / 3));
+      sortedIns.forEach((t, idx) => {
+        if (idx === 0) return; // skip the largest (main purchase)
+        if (Number(t.qty) > threshold) return;
+        // Skip if already tagged
+        if (t.note && t.note.includes('[RETURN]')) return;
+        candidates.add(t);
+      });
+    });
+
+    // STRATEGY 3: For items with NO purchases (only In + Out from sale file with returns):
+    // The smaller In transactions are returns. The startStock was set from total sale qty.
+    // Any In transaction is therefore a return (because we never created In for sales — only for returns and purchases).
+    // BUT we need to be careful: don't double-tag those already added by Strategy 2.
+    items.forEach(item => {
+      const stats = itemStats.get(item.id);
+      if (!stats) return;
+      // Find purchases (large In transactions) - if none, ALL Ins are returns
+      const hasLargePurchase = stats.ins.some(t => Number(t.qty) >= 6);
+      if (!hasLargePurchase && stats.ins.length > 0) {
+        // No purchase batch — all Ins are likely returns
+        stats.ins.forEach(t => {
+          if (t.note && t.note.includes('[RETURN]')) return;
+          candidates.add(t);
+        });
+      }
+    });
+
+    if (candidates.size === 0) {
+      alert('✓ No untagged returns found.\n\nAapka data already correctly tagged hai, OR ye fresh upload mein returns properly mark ho gaye hain.\n\nAgar abhi bhi Total Returns: 0 dikh raha hai, screenshot bhejo Activity tab ka.');
       return;
     }
 
-    const totalReturnQty = candidates.reduce((s, t) => s + Number(t.qty), 0);
-    const msg = `Detected ${candidates.length} return transactions (${totalReturnQty} pcs total).\n\n` +
-                `These will be tagged with [RETURN] so they show up correctly in the "Total Returns" KPI.\n\n` +
-                `✅ Stock numbers will NOT change — only the labels.\n\n` +
+    const candidatesArr = Array.from(candidates);
+    const totalReturnQty = candidatesArr.reduce((s, t) => s + Number(t.qty), 0);
+    const msg = `Detected ${candidatesArr.length} return transactions (${totalReturnQty} pcs total).\n\n` +
+                `Detection methods used:\n` +
+                `• Same bill number matching\n` +
+                `• Small-qty pattern detection (≤5 pcs after large purchase)\n` +
+                `• SKUs with no purchases (sale-only items)\n\n` +
+                `These will be tagged with [RETURN] so they show up in "Total Returns" KPI.\n\n` +
+                `✅ Stock numbers will NOT change — only labels.\n\n` +
                 `Continue?`;
     if (!confirm(msg)) return;
 
     // Apply tags
     showLoadingOverlay('Tagging returns...');
-    candidates.forEach(t => {
+    candidatesArr.forEach(t => {
       t.note = (t.note || '').trim() + ' [RETURN]';
     });
 
@@ -1824,10 +1886,9 @@
       bumpDataVersion();
       renderAll();
       switchTab('livestock');
-      toast(`✓ Tagged ${candidates.length} returns (${totalReturnQty} pcs)`);
+      toast(`✓ Tagged ${candidatesArr.length} returns (${totalReturnQty} pcs)`);
     } else {
-      // Rollback on save failure — remove the tag we just added
-      candidates.forEach(t => {
+      candidatesArr.forEach(t => {
         t.note = (t.note || '').replace(/ \[RETURN\]$/, '');
       });
       alert('⚠️ Save failed. Internet check karo aur dobara try karo.');
