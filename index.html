@@ -146,6 +146,12 @@
     margin-right: 4px;
   }
   .color-tag { background: rgba(45, 143, 60, 0.12); color: var(--accent); }
+  .group-tag {
+    display: inline-block; padding: 1px 6px; border-radius: 4px;
+    font-size: 10px; font-weight: 600;
+    background: rgba(217, 119, 6, 0.12); color: var(--warn);
+    margin-right: 4px;
+  }
 
   .pill {
     display: inline-block; padding: 3px 10px; border-radius: 100px;
@@ -555,6 +561,10 @@
       <label>Brand:</label>
       <select id="ls-brand" class="select" onchange="renderLiveStock()">
         <option value="all">All Brands</option>
+      </select>
+      <label>Group:</label>
+      <select id="ls-group" class="select" onchange="renderLiveStock()">
+        <option value="all">All Groups</option>
       </select>
       <label>Show:</label>
       <select id="ls-status" class="select" onchange="renderLiveStock()">
@@ -2790,7 +2800,7 @@
 
     // Build rows
     const headers = [
-      'Supplier', 'Supplier Phone', 'Brand', 'SKU Code', 'Item', 'Size', 'Color',
+      'Supplier', 'Supplier Phone', 'Brand', 'Group', 'SKU Code', 'Item', 'Size', 'Color',
       'Total Received', 'Total Sold', 'Sold in Days', 'Sold %', 'Current Stock',
       'Order Qty', 'MOQ', 'Max Level', 'Lead Time (days)', 'Reason'
     ];
@@ -2827,6 +2837,7 @@
         sup?.name || '',
         sup?.phone || '',
         b?.name || '',
+        i.category || '',
         i.id,
         i.name,
         i.size || '',
@@ -2848,7 +2859,7 @@
     const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
     // Column widths
     ws['!cols'] = [
-      { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 22 },
+      { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 12 }, { wch: 18 }, { wch: 22 },  // Supplier, Phone, Brand, Group, SKU, Item
       { wch: 8 },  { wch: 12 },
       { wch: 14 }, { wch: 12 }, { wch: 11 }, { wch: 9 },  // Total Received, Total Sold, Sold in Days, Sold %
       { wch: 13 }, { wch: 11 }, { wch: 8 },
@@ -2932,7 +2943,7 @@
 
     // Build rows for Excel
     const headers = [
-      'SKU', 'Item', 'Size', 'Color', 'Brand', 'Supplier', 'Supplier Phone',
+      'SKU', 'Item', 'Group', 'Size', 'Color', 'Brand', 'Supplier', 'Supplier Phone',
       'Total Received', 'Current Stock', 'Total Sold', 'Returns', 'Sold %',
       'Cost (₹)', 'Selling Price (₹)', 'Stock Value (₹)', 'Status'
     ];
@@ -2950,6 +2961,7 @@
       return [
         i.id,
         i.name || '',
+        i.category || '',
         i.size || '',
         i.color || '',
         b?.name || '',
@@ -2970,7 +2982,7 @@
     // Build worksheet
     const ws = XLSX.utils.aoa_to_sheet([headers, ...xlsxRows]);
     ws['!cols'] = [
-      { wch: 18 }, { wch: 24 }, { wch: 8 }, { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 14 },
+      { wch: 18 }, { wch: 24 }, { wch: 12 }, { wch: 8 }, { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 14 },  // SKU, Item, Group, Size, Color, Brand, Supplier, Phone
       { wch: 14 }, { wch: 13 }, { wch: 12 }, { wch: 10 }, { wch: 9 },
       { wch: 11 }, { wch: 13 }, { wch: 14 }, { wch: 14 }
     ];
@@ -3315,6 +3327,25 @@
       suppliers.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
     sel.value = suppliers.find(s => s.id === cur) || cur === 'all' ? cur : 'all';
   }
+  // Build dropdown of unique groups (categories) sorted alphabetically.
+  // Used by Live Stock to filter by Group like LADIES, MENS, JACKET etc.
+  function fillGroupDropdown(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const cur = sel.value;
+    // Collect unique non-empty categories (case-insensitive dedupe)
+    const seen = new Map();
+    items.forEach(i => {
+      const c = (i.category || '').trim();
+      if (!c) return;
+      const key = c.toLowerCase();
+      if (!seen.has(key)) seen.set(key, c);
+    });
+    const groups = Array.from(seen.values()).sort((a, b) => a.localeCompare(b));
+    sel.innerHTML = '<option value="all">All Groups</option>' +
+      groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+    sel.value = groups.find(g => g.toLowerCase() === (cur || '').toLowerCase()) || cur === 'all' ? cur : 'all';
+  }
 
   function onDashSupplierChange() { fillBrandDropdown('dash-brand', document.getElementById('dash-supplier').value); renderDashboard(); }
   function onInvSupplierChange() { fillBrandDropdown('inv-brand', document.getElementById('inv-supplier').value); renderInventory(); }
@@ -3350,6 +3381,8 @@
     fillBrandDropdown('reorder-brand', document.getElementById('reorder-supplier').value);
     fillBrandDropdown('fm-brand', document.getElementById('fm-supplier').value);
     fillBrandDropdown('act-brand', document.getElementById('act-supplier').value);
+    // Populate Group dropdown for Live Stock from unique categories
+    fillGroupDropdown('ls-group');
     // Settings inputs
     const setVd = document.getElementById('set-vd');
     const setVp = document.getElementById('set-vp');
@@ -3386,10 +3419,16 @@
   function renderLiveStock() {
     const supId = document.getElementById('ls-supplier').value;
     const brId = document.getElementById('ls-brand').value;
+    const groupSel = document.getElementById('ls-group');
+    const groupId = groupSel ? groupSel.value : 'all';
     const q = document.getElementById('ls-search').value;
     const statusFilter = document.getElementById('ls-status').value;
 
     let visible = applyFilters(supId, brId, q);
+    // Apply group filter (case-insensitive match on category/group name)
+    if (groupId !== 'all') {
+      visible = visible.filter(i => (i.category || '').toLowerCase() === groupId.toLowerCase());
+    }
     // Compute stock + status once per row
     const rows = visible.map(i => {
       const stock = getStock(i.id);
@@ -3491,6 +3530,7 @@
           <td>
             <div style="font-weight:500">${escapeHtml(i.name)}</div>
             <div style="font-size:11px; margin-top:3px;">
+              ${i.category ? `<span class="group-tag">${escapeHtml(i.category)}</span>` : ''}
               ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
               ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
               <span class="sku-tag">${i.id}</span>
@@ -3561,6 +3601,7 @@
           <td>
             <div style="font-weight:500">${escapeHtml(i.name)}</div>
             <div style="font-size:11px; margin-top:3px;">
+              ${i.category ? `<span class="group-tag">${escapeHtml(i.category)}</span>` : ''}
               ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
               ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
               <span class="sku-tag">${i.id}</span>
@@ -3725,6 +3766,7 @@
           <td>
             <div style="font-weight:500">${escapeHtml(i.name)}</div>
             <div style="font-size:11px; margin-top:3px;">
+              ${i.category ? `<span class="group-tag">${escapeHtml(i.category)}</span>` : ''}
               ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
               ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
               <span class="sku-tag">${i.id}</span>
@@ -3771,6 +3813,7 @@
           <td>
             <div style="font-weight:500">${escapeHtml(i.name)}</div>
             <div style="font-size:11px; margin-top:3px;">
+              ${i.category ? `<span class="group-tag">${escapeHtml(i.category)}</span>` : ''}
               ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
               ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
               <span class="sku-tag">${i.id}</span>
@@ -3915,6 +3958,7 @@
           <div>
             <div class="reorder-card-name">${escapeHtml(i.name)}</div>
             <div style="font-size:11px; margin-top:4px;">
+              ${i.category ? `<span class="group-tag">${escapeHtml(i.category)}</span>` : ''}
               ${i.size ? `<span class="size-tag">${escapeHtml(i.size)}</span>` : ''}
               ${i.color ? `<span class="color-tag">${escapeHtml(i.color)}</span>` : ''}
             </div>
@@ -3976,7 +4020,7 @@
         <tr>
           <td><span style="color:var(--text-dim); font-family: 'Geist Mono', monospace; font-size:11px;">${formatTime(t.ts)}</span></td>
           <td>
-            <div>${escapeHtml(t.item.name)} ${t.item.size ? `<span class="size-tag">${escapeHtml(t.item.size)}</span>` : ''} ${t.item.color ? `<span class="color-tag">${escapeHtml(t.item.color)}</span>` : ''}</div>
+            <div>${escapeHtml(t.item.name)} ${t.item.category ? `<span class="group-tag">${escapeHtml(t.item.category)}</span>` : ''} ${t.item.size ? `<span class="size-tag">${escapeHtml(t.item.size)}</span>` : ''} ${t.item.color ? `<span class="color-tag">${escapeHtml(t.item.color)}</span>` : ''}</div>
             ${t.note ? `<div style="font-size:11px; color:var(--text-dim); margin-top:2px;">${escapeHtml(t.note)}</div>` : ''}
           </td>
           <td>${escapeHtml(b?.name || '—')}</td>
