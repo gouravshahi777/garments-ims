@@ -855,6 +855,19 @@
       </p>
     </div>
 
+    <div class="setting-card" style="border-left: 3px solid var(--info);">
+      <h3>🔧 Fix Negative Stock</h3>
+      <p>
+        Agar Live Stock mein kuch items <strong style="color: var(--bad);">minus (-)</strong> mein dikh rahe hain, ye button click karo.
+      </p>
+      <p style="font-size: 12px;">
+        <strong>Reason:</strong> Aapke billing software mein purane purchase records nahi hain (Feb 2026 se pehle ka data missing hai), lekin sale mein wo purane lots ki sale aaye hain.
+        <br><br>
+        <strong>Ye button kya karega:</strong> Sabhi negative stock items ka <strong>opening stock auto-add</strong> kar dega, taki final stock = 0 ho jaye. Ye one-time fix hai aur safe hai.
+      </p>
+      <button class="btn btn-good" onclick="fixNegativeStock()">🔧 Fix All Negative Stock</button>
+    </div>
+
     <div class="setting-card">
       <h3>Sample data</h3>
       <p>Loaded with 2 suppliers, 4 brands, and 12 sample SKUs across sizes & colors.</p>
@@ -1654,6 +1667,62 @@
     toast('All data deleted');
   }
 
+  // Fix all negative stock by adding opening stock to deficit items
+  async function fixNegativeStock() {
+    if (!canEdit()) {
+      alert('Sirf Admin/Manager ye kar sakte hain.');
+      return;
+    }
+
+    // Force rebuild stock cache to get accurate numbers
+    bumpDataVersion();
+    buildStockCache();
+
+    // Find all negative stock items
+    const negativeItems = [];
+    items.forEach(item => {
+      const stock = getStock(item.id);
+      if (stock < 0) {
+        negativeItems.push({ item, stock, deficit: Math.abs(stock) });
+      }
+    });
+
+    if (negativeItems.length === 0) {
+      alert('✓ Koi negative stock nahi hai. Sab kuch sahi hai!');
+      return;
+    }
+
+    const totalDeficit = negativeItems.reduce((s, n) => s + n.deficit, 0);
+    const msg = `${negativeItems.length} SKUs mein negative stock hai.\n\n` +
+                `Kul ${totalDeficit} pieces ka opening stock add hoga taki sab stock 0 ya positive ho jaye.\n\n` +
+                `Continue?\n\n(Ye safe hai — sirf negative SKUs ka starting stock badhega)`;
+    if (!confirm(msg)) return;
+
+    // Apply fix
+    showLoadingOverlay('Fixing negative stock...');
+    negativeItems.forEach(({ item, deficit }) => {
+      item.startStock = (Number(item.startStock) || 0) + deficit;
+    });
+    bumpDataVersion();
+
+    await saveAll();
+    hideLoadingOverlay();
+
+    if (lastSaveOk) {
+      renderAll();
+      switchTab('livestock');
+      toast(`✓ Fixed ${negativeItems.length} SKUs (+${totalDeficit} pcs opening stock)`);
+    } else {
+      // Rollback on save failure
+      negativeItems.forEach(({ item, deficit }) => {
+        item.startStock = (Number(item.startStock) || 0) - deficit;
+      });
+      bumpDataVersion();
+      alert('⚠️ Fix save nahi hua. Internet check karo aur dobara try karo.');
+      renderAll();
+    }
+  }
+
   // ============== BACKUP & RESTORE ==============
   function downloadBackup() {
     const backup = {
@@ -2346,6 +2415,51 @@
     pendingNewBrands = [];
     pendingNewSkus = [];
 
+    // ============== AUTO-FIX NEGATIVE STOCK (sale uploads only) ==============
+    // For EXISTING SKUs (already in items array), check if total sales now exceed
+    // total purchases + returns. If so, the shop must have had pre-existing stock
+    // before our records start (e.g. December 2025 stock that was sold in Feb-May 2026
+    // but never had matching purchase records).
+    //
+    // Bump up startStock for those SKUs so final stock = 0 instead of negative.
+    // This handles real-world cases where billing software has limited history.
+    let autoFixCount = 0;
+    let autoFixTotalPcs = 0;
+    if (uploadType === 'Out') {
+      // Force-rebuild the stock cache so we get accurate post-import stock
+      bumpDataVersion();
+      buildStockCache();
+
+      // Get unique SKUs that were touched by this sale upload
+      const touchedSkus = new Set();
+      valid.forEach(r => {
+        const itemId = r.item ? r.item.id : r.sku;
+        if (itemId) touchedSkus.add(itemId);
+      });
+
+      // For each touched SKU, check if current stock is negative
+      touchedSkus.forEach(skuId => {
+        const item = items.find(i => i.id === skuId);
+        if (!item) return;
+        const stock = getStock(skuId);
+        if (stock < 0) {
+          // Bump up startStock by the absolute value of the negative stock
+          // so that final stock = 0
+          const deficit = Math.abs(stock);
+          item.startStock = (Number(item.startStock) || 0) + deficit;
+          autoFixCount++;
+          autoFixTotalPcs += deficit;
+        }
+      });
+
+      if (autoFixCount > 0) {
+        // Invalidate the cache since we changed startStock values
+        bumpDataVersion();
+        console.log(`✓ Auto-fixed ${autoFixCount} SKUs (added ${autoFixTotalPcs} pcs of opening stock)`);
+      }
+    }
+    // ============== END AUTO-FIX ==============
+
     // Show progress for big imports
     const isBigImport = valid.length > 1000;
     if (isBigImport) {
@@ -2368,7 +2482,11 @@
     closeModal('upload-modal');
     renderAll();
     switchTab('livestock');
-    toast(`✓ Imported ${valid.length} ${uploadType === 'In' ? 'purchase' : 'sale'} row${valid.length===1?'':'s'}`);
+    let successMsg = `✓ Imported ${valid.length} ${uploadType === 'In' ? 'purchase' : 'sale'} row${valid.length===1?'':'s'}`;
+    if (autoFixCount > 0) {
+      successMsg += ` · Auto-fixed ${autoFixCount} SKUs (+${autoFixTotalPcs} pcs opening stock)`;
+    }
+    toast(successMsg);
   }
 
   // Robust date parser — handles dd/mm/yyyy, yyyy-mm-dd, JS Date strings
