@@ -3789,18 +3789,20 @@
       return { item: i, stock, status, velocity: v };
     });
 
-    // FAST MOVERS: items that hit the velocity threshold (75%+ sold within 20 days).
+    // FAST MOVERS: items that sold 75% (or threshold%) STRICTLY BEFORE 20 days (or windowDays).
+    // Example: 75% sold in 15 days = fast mover
+    //          75% sold in 20 days = NOT fast mover (goes to regular reorder)
     // These ONLY appear in Fast Movers tab, NOT in Reorder List.
-    const fastMovers = all.filter(r => r.velocity.triggered);
+    const fastMovers = all.filter(r => r.velocity.isTrueFastMover);
 
     // REORDER LIST: items that need ordering BUT are NOT fast movers.
-    // - Out of stock (with no velocity trigger)
-    // - Below reorder point (with no velocity trigger)
-    // - Low stock (with no velocity trigger)
-    // Items with 75%+ sales velocity go to Fast Movers tab only.
+    // - Out of stock (with no fast-mover trigger)
+    // - Below reorder point (with no fast-mover trigger)
+    // - Low stock (with no fast-mover trigger)
+    // - Items that hit 75% but at exactly the 20-day window (slow-fast — borderline)
     const regular = all.filter(r => {
-      // Skip if this is a fast mover (goes to Fast Movers tab only)
-      if (r.velocity.triggered) return false;
+      // Skip if this is a true fast mover (goes to Fast Movers tab only)
+      if (r.velocity.isTrueFastMover) return false;
       // Otherwise include if it needs ordering for stock reasons
       return r.status === 'outofstock' ||
              r.status === 'reorder' ||
@@ -3837,7 +3839,7 @@
     // Update the explainer with current settings
     const expl = document.getElementById('fm-explainer');
     if (expl) {
-      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% or more of the last batch sold within ${settings.velocityDays} days. These items sell fast — order more next time! Suggested order = last batch × ${settings.fastMoverMultiplier}.`;
+      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% of the last batch sold in <strong>less than ${settings.velocityDays} days</strong>. These items sell super fast — order more next time! Suggested order = last batch × ${settings.fastMoverMultiplier}.`;
     }
 
     document.getElementById('fm-count').textContent =
