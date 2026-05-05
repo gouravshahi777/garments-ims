@@ -3924,7 +3924,7 @@
         </div>
         <div style="background:var(--bg); padding:8px 10px; border-radius:6px; margin-bottom:12px; font-size:12px; border-left:2px solid ${accentColor};">
           <strong>Why:</strong> ${escapeHtml(reason)}
-          ${latest ? `<div style="font-size:11px; color:var(--text-dim); margin-top:3px;">Last batch: received ${fmt(latest.received)} on ${formatDate(latest.ts)}, sold ${fmt(latest.soldInWindow)} (${Math.round(latest.pct)}%)</div>` : ''}
+          ${latest ? `<div style="font-size:11px; color:var(--text-dim); margin-top:3px;">Last batch: received ${fmt(latest.received)} pcs on ${formatDate(latest.ts)}</div>` : ''}
         </div>
         <div class="reorder-card-stats">
           <div class="stat-block"><div class="stat-label">Current Stock</div><div class="stat-value">${fmt(r.stock, 0)}</div></div>
