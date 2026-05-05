@@ -3146,84 +3146,91 @@
   }
 
   function getVelocityCheck(itemId) {
-    const windowDays = Number(settings.velocityDays) || 30;
-    const thresholdPct = Number(settings.velocityPct) || 50;
-    const windowMs = windowDays * 24 * 60 * 60 * 1000;
+    const windowDays = Number(settings.velocityDays) || 20;
+    const thresholdPct = Number(settings.velocityPct) || 75;
 
     if (txByItemVersion !== dataVersion || !txByItemCache) {
       buildTxByItemCache();
     }
     const itemTx = txByItemCache.get(itemId) || [];
 
-    // MIN BATCH SIZE: ignore tiny "In" transactions (likely customer returns).
-    // Real purchase batches are usually 10+ pcs in garments retail.
-    // This prevents false "fast mover" flags from a 2-3 pc return showing 100% sold.
-    const MIN_BATCH_SIZE = 10;
+    // SIMPLE & RELIABLE FAST MOVER LOGIC:
+    //
+    // Step 1: Calculate total received (real purchases only) and total sold
+    //   - Skip [RETURN] tagged transactions
+    //   - Receives include all sizes; we don't filter by batch size for totals
+    //
+    // Step 2: Find first purchase date and last sale date
+    //
+    // Step 3: A SKU is a TRUE FAST MOVER only if ALL of these are true:
+    //   ✓ Has at least one real purchase (totalReceived ≥ 10)
+    //   ✓ Total sold ≥ thresholdPct% of total received
+    //   ✓ Days span (first purchase → last sale) < windowDays
+    //   ✓ Has actual sales (not just opening stock)
 
+    let totalReceived = 0;
+    let totalSold = 0;
+    let firstPurchaseTs = null;
+    let lastSaleTs = 0;
+    let lastBatchQty = 0;
+    let lastBatchTs = 0;
+
+    itemTx.forEach(t => {
+      const isReturn = t.note && (t.note.includes('[RETURN]') || t.note === 'RETURN' || t.note.endsWith(' RETURN'));
+      if (t.type === 'In') {
+        if (isReturn) return; // skip returns from received calculation
+        totalReceived += Number(t.qty);
+        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
+        if (t.ts > lastBatchTs) {
+          lastBatchTs = t.ts;
+          lastBatchQty = Number(t.qty);
+        }
+      } else if (t.type === 'Out') {
+        if (isReturn) return; // skip returns from sold calculation
+        totalSold += Number(t.qty);
+        if (t.ts > lastSaleTs) lastSaleTs = t.ts;
+      }
+    });
+
+    // Build batches array for backward compatibility (used by other code parts)
+    // Each "real" In transaction (not a return) becomes a batch entry
     const batches = [];
     itemTx.forEach(tx => {
       if (tx.type !== 'In') return;
-      // Skip tiny In transactions — they're returns, not real purchase batches
-      if (Number(tx.qty) < MIN_BATCH_SIZE) return;
-      // Skip explicit returns (tagged with [RETURN])
-      if (tx.note && (tx.note.includes('[RETURN]') || tx.note === 'RETURN' || tx.note.endsWith(' RETURN'))) return;
-
-      const batchEnd = tx.ts + windowMs;
-      // Sum OUT transactions within the window after this batch
-      const soldInWindow = itemTx
-        .filter(t => t.type === 'Out' && t.ts >= tx.ts && t.ts <= batchEnd)
-        .reduce((s, t) => s + Number(t.qty), 0);
-      // But don't credit a batch with sales it couldn't have supplied:
-      // cap at what this batch actually contributed (Number(tx.qty))
-      const credited = Math.min(soldInWindow, Number(tx.qty));
-      const pct = tx.qty > 0 ? (credited / Number(tx.qty)) * 100 : 0;
-      const windowEnded = Date.now() >= batchEnd;
-      const thresholdMet = pct >= thresholdPct;
-
-      // FIND the actual day when threshold was crossed (cumulative sale)
-      // This is critical for "Fast Mover" detection — we want SKUs where threshold
-      // was hit STRICTLY BEFORE windowDays, not at exactly windowDays.
-      let daysToThreshold = null;
-      if (thresholdMet) {
-        const targetQty = (thresholdPct / 100) * Number(tx.qty);
-        let cumulative = 0;
-        // Get sales after this batch in chronological order
-        const salesAfterBatch = itemTx
-          .filter(t => t.type === 'Out' && t.ts >= tx.ts && t.ts <= batchEnd)
-          .sort((a, b) => a.ts - b.ts);
-        for (const sale of salesAfterBatch) {
-          cumulative += Number(sale.qty);
-          if (cumulative >= targetQty) {
-            daysToThreshold = (sale.ts - tx.ts) / (24 * 60 * 60 * 1000);
-            break;
-          }
-        }
-      }
-
+      const isReturn = tx.note && (tx.note.includes('[RETURN]') || tx.note === 'RETURN' || tx.note.endsWith(' RETURN'));
+      if (isReturn) return;
       batches.push({
         ts: tx.ts,
         received: Number(tx.qty),
-        soldInWindow: credited,
-        pct,
-        windowEnded,
-        thresholdMet,
-        daysToThreshold  // null if threshold not met, otherwise actual days taken
+        soldInWindow: 0,
+        pct: 0,
+        windowEnded: true,
+        thresholdMet: false,
+        daysToThreshold: null
       });
     });
 
-    // "Drop off when stock goes back up": once a NEW batch arrives AFTER a
-    // triggering batch, the trigger only counts if sales since that newest batch
-    // also hit the threshold within the window. So we look at the LATEST batch only.
-    const latest = batches[batches.length - 1];
-    let triggered = false;
+    // CRITICAL: TRUE FAST MOVER CRITERIA
     let isTrueFastMover = false;
-    if (latest && latest.thresholdMet) {
-      triggered = true;
-      // TRUE FAST MOVER: threshold hit STRICTLY BEFORE windowDays (not at exactly windowDays)
-      // Example: 75% in 15 days = fast mover (15 < 20)
-      // Example: 75% in 20 days = NOT fast mover (just regular reorder)
-      if (latest.daysToThreshold !== null && latest.daysToThreshold < windowDays) {
+    let triggered = false;
+
+    if (totalReceived >= 10 && totalSold > 0 && firstPurchaseTs !== null && lastSaleTs > 0) {
+      const soldPct = (totalSold / totalReceived) * 100;
+      const daysSpan = (lastSaleTs - firstPurchaseTs) / (24 * 60 * 60 * 1000);
+
+      // Must hit threshold AND happen in less than windowDays
+      if (soldPct >= thresholdPct && daysSpan < windowDays && daysSpan >= 0) {
         isTrueFastMover = true;
+        triggered = true;
+
+        // Update latest batch with the real numbers (so card display shows correctly)
+        if (batches.length > 0) {
+          const latestBatch = batches[batches.length - 1];
+          latestBatch.soldInWindow = totalSold;
+          latestBatch.pct = soldPct;
+          latestBatch.thresholdMet = true;
+          latestBatch.daysToThreshold = daysSpan;
+        }
       }
     }
 
