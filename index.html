@@ -518,6 +518,35 @@
 
   <!-- LIVE STOCK (focused, default tab) -->
   <div id="tab-livestock" class="tab-content">
+    <!-- KPI row for Live Stock - dynamically updates with filters -->
+    <div class="kpi-row" style="grid-template-columns: repeat(5, 1fr);">
+      <div class="kpi info">
+        <div class="kpi-label">Total Received</div>
+        <div class="kpi-value" id="ls-kpi-received">—</div>
+        <div class="kpi-meta">ever purchased</div>
+      </div>
+      <div class="kpi info">
+        <div class="kpi-label">Total Stock</div>
+        <div class="kpi-value" id="ls-kpi-stock">—</div>
+        <div class="kpi-meta">in inventory now</div>
+      </div>
+      <div class="kpi good">
+        <div class="kpi-label">Total Sold</div>
+        <div class="kpi-value" id="ls-kpi-sold">—</div>
+        <div class="kpi-meta">pcs sold</div>
+      </div>
+      <div class="kpi warn">
+        <div class="kpi-label">Total Returns</div>
+        <div class="kpi-value" id="ls-kpi-return">—</div>
+        <div class="kpi-meta">customer returns</div>
+      </div>
+      <div class="kpi info">
+        <div class="kpi-label">Sold %</div>
+        <div class="kpi-value" id="ls-kpi-pct">—</div>
+        <div class="kpi-meta" id="ls-kpi-pct-meta">sell-through</div>
+      </div>
+    </div>
+
     <div class="filter-bar">
       <label>Supplier:</label>
       <select id="ls-supplier" class="select" onchange="onLiveStockSupplierChange()">
@@ -534,6 +563,7 @@
         <option value="lowstock">Low / Out of Stock</option>
       </select>
       <input id="ls-search" class="input search-input" type="text" placeholder="Search name, SKU, size, color..." oninput="renderLiveStock()" />
+      <button class="btn btn-good btn-sm" onclick="downloadLiveStockXLSX()" title="Download filtered items to Excel">↓ Download Excel</button>
       <span style="margin-left:auto; color: var(--text-dim); font-size:12px" id="ls-count"></span>
     </div>
 
@@ -2657,6 +2687,122 @@
     toast(`✓ Downloaded ${list.length} item${list.length===1?'':'s'} to ${filename}`);
   }
 
+  // Download Live Stock as Excel — respects current filter (supplier, brand, status, search)
+  function downloadLiveStockXLSX() {
+    const supId = document.getElementById('ls-supplier').value;
+    const brId = document.getElementById('ls-brand').value;
+    const q = document.getElementById('ls-search').value;
+    const statusFilter = document.getElementById('ls-status').value;
+
+    let visible = applyFilters(supId, brId, q);
+    const rows = visible.map(i => {
+      const stock = getStock(i.id);
+      const status = getStatus(i, stock);
+      return { item: i, stock, status };
+    });
+
+    let filtered = rows;
+    if (statusFilter === 'instock') {
+      filtered = rows.filter(r => r.stock > 0);
+    } else if (statusFilter === 'lowstock') {
+      filtered = rows.filter(r => r.status === 'outofstock' || r.status === 'reorder' || r.status === 'low');
+    }
+
+    if (filtered.length === 0) {
+      alert('No items match the current filter. Adjust filter and try again.');
+      return;
+    }
+
+    // Sort: out of stock first, then reorder/low, then by stock desc
+    const sortOrder = { outofstock: 0, reorder: 1, low: 2, healthy: 3, overstock: 4 };
+    filtered.sort((a, b) => {
+      const o = sortOrder[a.status] - sortOrder[b.status];
+      if (o !== 0) return o;
+      return b.stock - a.stock;
+    });
+
+    // Build a per-item summary of received/sold/returns from transactions
+    const txSummary = new Map(); // itemId → {received, sold, returns}
+    transactions.forEach(t => {
+      let s = txSummary.get(t.itemId);
+      if (!s) {
+        s = { received: 0, sold: 0, returns: 0 };
+        txSummary.set(t.itemId, s);
+      }
+      const isReturn = t.note && t.note.includes('[RETURN]');
+      if (t.type === 'In') {
+        if (isReturn) s.returns += Number(t.qty);
+        else s.received += Number(t.qty);
+      } else if (t.type === 'Out') {
+        if (isReturn) s.received -= Number(t.qty);
+        else s.sold += Number(t.qty);
+      }
+    });
+
+    // Build rows for Excel
+    const headers = [
+      'SKU', 'Item', 'Size', 'Color', 'Brand', 'Supplier', 'Supplier Phone',
+      'Total Received', 'Current Stock', 'Total Sold', 'Returns', 'Sold %',
+      'Cost (₹)', 'Selling Price (₹)', 'Stock Value (₹)', 'Status'
+    ];
+
+    const xlsxRows = filtered.map(r => {
+      const i = r.item;
+      const b = getBrand(i.brandId);
+      const sup = getItemSupplier(i);
+      const s = txSummary.get(i.id) || { received: 0, sold: 0, returns: 0 };
+      const soldPct = s.received > 0 ? Math.round((s.sold / s.received) * 100) : 0;
+      const stockValue = r.stock * (Number(i.cost) || 0);
+      return [
+        i.id,
+        i.name || '',
+        i.size || '',
+        i.color || '',
+        b?.name || '',
+        sup?.name || '',
+        sup?.phone || '',
+        s.received,
+        Math.round(r.stock),
+        s.sold,
+        s.returns,
+        soldPct + '%',
+        Number(i.cost) || 0,
+        Number(i.sell) || 0,
+        Math.round(stockValue),
+        statusLabel(r.status)
+      ];
+    });
+
+    // Build worksheet
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...xlsxRows]);
+    ws['!cols'] = [
+      { wch: 18 }, { wch: 24 }, { wch: 8 }, { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 14 },
+      { wch: 14 }, { wch: 13 }, { wch: 12 }, { wch: 10 }, { wch: 9 },
+      { wch: 11 }, { wch: 13 }, { wch: 14 }, { wch: 14 }
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Live Stock');
+
+    // Filename: include scope info from filter
+    const today = new Date().toISOString().slice(0, 10);
+    let scope = 'all';
+    if (supId !== 'all') {
+      const sup = getSupplier(supId);
+      if (sup) scope = sup.name.replace(/[^a-z0-9]/gi, '_');
+    } else if (brId !== 'all') {
+      const b = getBrand(brId);
+      if (b) scope = b.name.replace(/[^a-z0-9]/gi, '_');
+    }
+    if (statusFilter !== 'all') {
+      scope += '_' + statusFilter;
+    }
+    const filename = `LiveStock_${scope}_${today}.xlsx`;
+
+    XLSX.writeFile(wb, filename);
+    toast(`✓ Downloaded ${filtered.length} item${filtered.length===1?'':'s'} to ${filename}`);
+  }
+
   // ============== CALCULATIONS ==============
   // Cache stock by itemId — rebuilt whenever transactions change.
   // This is critical for performance: without caching, getStock runs O(N×M)
@@ -3058,6 +3204,53 @@
 
     document.getElementById('ls-count').textContent =
       `${filtered.length} of ${items.length} item${items.length === 1 ? '' : 's'}`;
+
+    // ============== UPDATE KPIs (based on current Supplier/Brand filter) ==============
+    // Note: KPIs use Supplier/Brand filter (not Status filter) — so user always sees totals
+    // for selected supplier/brand even when filtering view by "Out of Stock only"
+    const visibleItemIds = new Set(visible.map(i => i.id));
+    let lsTotalStock = 0;
+    let lsTotalReceived = 0;
+    let lsTotalSold = 0;
+    let lsTotalReturns = 0;
+
+    visible.forEach(i => {
+      lsTotalStock += getStock(i.id);
+    });
+
+    transactions.forEach(t => {
+      if (!visibleItemIds.has(t.itemId)) return;
+      const isReturn = t.note && t.note.includes('[RETURN]');
+      if (t.type === 'In') {
+        if (isReturn) {
+          // Customer return → counts as a return, not a purchase
+          lsTotalReturns += Number(t.qty);
+        } else {
+          // Regular purchase
+          lsTotalReceived += Number(t.qty);
+        }
+      } else if (t.type === 'Out') {
+        if (isReturn) {
+          // Supplier return (rare) → reduces received, not sold
+          lsTotalReceived -= Number(t.qty);
+        } else {
+          // Regular sale
+          lsTotalSold += Number(t.qty);
+        }
+      }
+    });
+
+    // Sold % = (Total Sold / Total Received) — how much of what we bought has been sold
+    const lsSoldPct = lsTotalReceived > 0 ? Math.round((lsTotalSold / lsTotalReceived) * 100) : 0;
+
+    document.getElementById('ls-kpi-received').textContent = fmt(lsTotalReceived, 0);
+    document.getElementById('ls-kpi-stock').textContent = fmt(lsTotalStock, 0);
+    document.getElementById('ls-kpi-sold').textContent = fmt(lsTotalSold, 0);
+    document.getElementById('ls-kpi-return').textContent = fmt(lsTotalReturns, 0);
+    document.getElementById('ls-kpi-pct').textContent = lsSoldPct + '%';
+    document.getElementById('ls-kpi-pct-meta').textContent =
+      `${fmt(lsTotalSold, 0)} of ${fmt(lsTotalReceived, 0)} sold`;
+    // ============== END KPIs ==============
 
     const tbody = document.getElementById('ls-tbody');
     if (filtered.length === 0) {
