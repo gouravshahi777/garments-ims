@@ -2932,21 +2932,12 @@
       const sup = getItemSupplier(i);
       const orderQty = Math.ceil(getReorderQty(i, r.stock));
 
-      // Calculate total received, total sold, and days span (first purchase → last sale)
-      let totalReceived = 0;
-      let totalSold = 0;
-      let firstPurchaseTs = null;
-      let lastSaleTs = 0;
-      transactions.forEach(t => {
-        if (t.itemId !== i.id) return;
-        if (t.type === 'In') {
-          totalReceived += Number(t.qty);
-          if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
-        } else if (t.type === 'Out') {
-          totalSold += Number(t.qty);
-          if (t.ts > lastSaleTs) lastSaleTs = t.ts;
-        }
-      });
+      // PERFORMANCE: Use pre-built cache instead of looping all transactions per row
+      const stats = getAutoStats(i.id);
+      const totalReceived = stats.totalReceived;
+      const totalSold = stats.totalSold;
+      const firstPurchaseTs = stats.firstPurchaseTs;
+      const lastSaleTs = stats.lastSaleTs;
       let daysSpan = 0;
       if (firstPurchaseTs !== null) {
         const endTs = lastSaleTs > 0 ? lastSaleTs : Date.now();
@@ -3042,25 +3033,9 @@
       return b.stock - a.stock;
     });
 
-    // Build a per-item summary of received/sold/returns from transactions
-    // Uses [RETURN] tag for detection (set during fresh sale uploads)
-    const txSummary = new Map(); // itemId → {received, sold, returns}
-    transactions.forEach(t => {
-      let s = txSummary.get(t.itemId);
-      if (!s) {
-        s = { received: 0, sold: 0, returns: 0 };
-        txSummary.set(t.itemId, s);
-      }
-      // Check for return tag — supports both '[RETURN]' (new) and 'RETURN' (old data)
-      const isReturn = t.note && (t.note.includes('[RETURN]') || t.note === 'RETURN' || t.note.endsWith(' RETURN'));
-      if (t.type === 'In') {
-        if (isReturn) s.returns += Number(t.qty);
-        else s.received += Number(t.qty);
-      } else if (t.type === 'Out') {
-        if (isReturn) s.received -= Number(t.qty);
-        else s.sold += Number(t.qty);
-      }
-    });
+    // PERFORMANCE: Use the pre-built autoStats cache (built once for all items)
+    // instead of looping all transactions. Cache invalidates automatically when
+    // data changes via dataVersion.
 
     // Build rows for Excel
     const headers = [
@@ -3073,11 +3048,11 @@
       const i = r.item;
       const b = getBrand(i.brandId);
       const sup = getItemSupplier(i);
-      const s = txSummary.get(i.id) || { received: 0, sold: 0, returns: 0 };
-      // Total Received = transaction-based In + opening stock (pre-existing inventory)
+      const s = getAutoStats(i.id);
+      // Total Received = cached received + opening stock (pre-existing inventory)
       const opening = Number(i.startStock || 0);
-      const totalReceivedForItem = s.received + opening;
-      const soldPct = totalReceivedForItem > 0 ? Math.round((s.sold / totalReceivedForItem) * 100) : 0;
+      const totalReceivedForItem = s.totalReceived + opening;
+      const soldPct = totalReceivedForItem > 0 ? Math.round((s.totalSold / totalReceivedForItem) * 100) : 0;
       const stockValue = r.stock * (Number(i.cost) || 0);
       return [
         i.id,
@@ -3090,8 +3065,8 @@
         sup?.phone || '',
         totalReceivedForItem,
         Math.round(r.stock),
-        s.sold,
-        s.returns,
+        s.totalSold,
+        s.totalReturns,
         soldPct + '%',
         Number(i.cost) || 0,
         Number(i.sell) || 0,
@@ -3328,53 +3303,75 @@
   let autoStatsCache = null;
   let autoStatsVersion = -1;
 
-  function getAutoStats(itemId) {
-    // Cache by dataVersion (same as stockCache) for performance
-    if (autoStatsVersion !== dataVersion || !autoStatsCache) {
-      autoStatsCache = new Map();
-      autoStatsVersion = dataVersion;
-    }
-    if (autoStatsCache.has(itemId)) return autoStatsCache.get(itemId);
-
-    let totalReceived = 0;
-    let totalSold = 0;
-    let firstPurchaseTs = null;
-    let lastBatchQty = 0;
-    let lastBatchTs = 0;
-
+  // Build the autoStats cache for ALL items in a single pass.
+  // CRITICAL PERFORMANCE FIX: Without this, getAutoStats(itemId) was called
+  // per-card with a full transactions.forEach inside — O(items × transactions)
+  // = 9,400 × 57,000 = 540 MILLION ops on every render. Now it's O(transactions)
+  // built once and reused. Renders that took 5-6s now take milliseconds.
+  function buildAutoStatsCache() {
+    autoStatsCache = new Map();
+    autoStatsVersion = dataVersion;
+    // Initialize entry for every item
+    items.forEach(i => {
+      autoStatsCache.set(i.id, {
+        totalReceived: 0,
+        totalSold: 0,
+        totalReturns: 0,
+        firstPurchaseTs: null,
+        lastSaleTs: 0,
+        lastBatchQty: 0,
+        lastBatchTs: 0,
+        avgDailySale: 0,
+        autoMaxLevel: 0,
+        autoMOQ: 0,
+        autoReorderThreshold: 0
+      });
+    });
+    // Single pass through ALL transactions
     transactions.forEach(t => {
-      if (t.itemId !== itemId) return;
+      const s = autoStatsCache.get(t.itemId);
+      if (!s) return; // item was deleted
+      const isReturn = t.note && (t.note.includes('[RETURN]') || t.note === 'RETURN' || t.note.endsWith(' RETURN'));
       if (t.type === 'In') {
-        totalReceived += Number(t.qty);
-        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
-        if (t.ts > lastBatchTs) {
-          lastBatchTs = t.ts;
-          lastBatchQty = Number(t.qty);
+        if (isReturn) {
+          s.totalReturns += Number(t.qty);
+        } else {
+          s.totalReceived += Number(t.qty);
+          if (s.firstPurchaseTs === null || t.ts < s.firstPurchaseTs) s.firstPurchaseTs = t.ts;
+          if (t.ts > s.lastBatchTs) {
+            s.lastBatchTs = t.ts;
+            s.lastBatchQty = Number(t.qty);
+          }
         }
       } else if (t.type === 'Out') {
-        totalSold += Number(t.qty);
+        if (!isReturn) {
+          s.totalSold += Number(t.qty);
+          if (t.ts > s.lastSaleTs) s.lastSaleTs = t.ts;
+        }
       }
     });
+    // Compute derived values
+    const nowTs = Date.now();
+    autoStatsCache.forEach(s => {
+      if (s.totalSold > 0 && s.firstPurchaseTs !== null) {
+        const daysSinceFirst = Math.max(1, (nowTs - s.firstPurchaseTs) / (24 * 60 * 60 * 1000));
+        s.avgDailySale = s.totalSold / daysSinceFirst;
+      }
+      s.autoMaxLevel = Math.ceil(s.avgDailySale * 60);
+      s.autoMOQ = s.lastBatchQty;
+      s.autoReorderThreshold = s.avgDailySale * 30;
+    });
+  }
 
-    // Calculate daily sale rate based on actual data
-    let avgDailySale = 0;
-    if (totalSold > 0 && firstPurchaseTs !== null) {
-      const daysSinceFirst = Math.max(1, (Date.now() - firstPurchaseTs) / (24 * 60 * 60 * 1000));
-      avgDailySale = totalSold / daysSinceFirst;
+  function getAutoStats(itemId) {
+    if (autoStatsVersion !== dataVersion || !autoStatsCache) {
+      buildAutoStatsCache();
     }
-
-    const stats = {
-      totalReceived,
-      totalSold,
-      avgDailySale,
-      lastBatchQty,
-      // Auto-calculated suggestions:
-      autoMaxLevel: Math.ceil(avgDailySale * 60),  // 2 months supply
-      autoMOQ: lastBatchQty,                        // re-order what you ordered before
-      autoReorderThreshold: avgDailySale * 30       // 1 month safety
+    return autoStatsCache.get(itemId) || {
+      totalReceived: 0, totalSold: 0, totalReturns: 0,
+      firstPurchaseTs: null, lastSaleTs: 0, lastBatchQty: 0, lastBatchTs: 0,
+      avgDailySale: 0, autoMaxLevel: 0, autoMOQ: 0, autoReorderThreshold: 0
     };
-    autoStatsCache.set(itemId, stats);
-    return stats;
   }
 
   // Helper to get effective Max Level (manual or auto)
@@ -3730,23 +3727,13 @@
       lsTotalOpening += Number(i.startStock || 0);
     });
 
-    transactions.forEach(t => {
-      if (!visibleItemIds.has(t.itemId)) return;
-      // Check for return tag — supports both '[RETURN]' (new) and 'RETURN' (old data)
-      const isReturn = t.note && (t.note.includes('[RETURN]') || t.note === 'RETURN' || t.note.endsWith(' RETURN'));
-      if (t.type === 'In') {
-        if (isReturn) {
-          lsTotalReturns += Number(t.qty);
-        } else {
-          lsTotalReceived += Number(t.qty);
-        }
-      } else if (t.type === 'Out') {
-        if (isReturn) {
-          lsTotalReceived -= Number(t.qty);
-        } else {
-          lsTotalSold += Number(t.qty);
-        }
-      }
+    // PERFORMANCE: Use pre-built autoStats cache instead of looping all transactions.
+    // Old code looped 57K+ tx for every render — froze browser. Cache gives O(items) lookup.
+    visible.forEach(i => {
+      const s = getAutoStats(i.id);
+      lsTotalReceived += s.totalReceived;
+      lsTotalSold += s.totalSold;
+      lsTotalReturns += s.totalReturns;
     });
 
     // Add opening stock to Total Received — it's all stock that came IN to the shop
@@ -3817,10 +3804,11 @@
       else if (status === 'reorder' || status === 'low') reorderCount++;
       totalValue += s * (Number(i.cost) || 0);
     });
-    // Calculate overall sold % from all transactions
-    transactions.forEach(t => {
-      if (t.type === 'In') totalReceived += Number(t.qty);
-      else if (t.type === 'Out') totalSold += Number(t.qty);
+    // Calculate overall sold % from cached stats (much faster than looping transactions)
+    items.forEach(i => {
+      const s = getAutoStats(i.id);
+      totalReceived += s.totalReceived;
+      totalSold += s.totalSold;
     });
     const overallSoldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
 
@@ -4191,7 +4179,12 @@
       wrap.innerHTML = `<div class="table-wrap"><div class="empty"><div class="empty-icon">✓</div>No regular reorders. Anything fast-moving will be in the Fast Movers tab.</div></div>`;
       return;
     }
-    wrap.innerHTML = `<div class="reorder-grid">${regular.map(r => renderReorderCard(r, 'regular')).join('')}</div>`;
+    // Performance: cap at 200 cards on screen — 5,000+ cards would freeze the browser
+    const MAX_CARDS = 200;
+    const displayList = regular.slice(0, MAX_CARDS);
+    const truncated = regular.length > MAX_CARDS;
+    wrap.innerHTML = `<div class="reorder-grid">${displayList.map(r => renderReorderCard(r, 'regular')).join('')}</div>` +
+      (truncated ? `<div style="text-align:center; padding:18px; color:var(--text-dim); font-size:13px; margin-top:14px; background:var(--panel-2); border-radius:8px;">Showing first ${MAX_CARDS} of ${fmt(regular.length)} items. Use Supplier/Brand filter to narrow down, or download Excel to see all.</div>` : '');
   }
 
   function renderFastMovers() {
@@ -4215,7 +4208,12 @@
       wrap.innerHTML = `<div class="table-wrap"><div class="empty"><div class="empty-icon">✓</div>Nothing is selling fast enough in the ${days}-day window. Try a larger window above.</div></div>`;
       return;
     }
-    wrap.innerHTML = `<div class="reorder-grid">${fastMovers.map(r => renderReorderCard(r, 'fastmover')).join('')}</div>`;
+    // Performance: cap at 200 cards on screen
+    const MAX_CARDS = 200;
+    const displayList = fastMovers.slice(0, MAX_CARDS);
+    const truncated = fastMovers.length > MAX_CARDS;
+    wrap.innerHTML = `<div class="reorder-grid">${displayList.map(r => renderReorderCard(r, 'fastmover')).join('')}</div>` +
+      (truncated ? `<div style="text-align:center; padding:18px; color:var(--text-dim); font-size:13px; margin-top:14px; background:var(--panel-2); border-radius:8px;">Showing first ${MAX_CARDS} of ${fmt(fastMovers.length)} items. Use Supplier/Brand filter to narrow down, or download Excel to see all.</div>` : '');
   }
 
   function renderReorderCard(r, kind) {
@@ -4228,21 +4226,13 @@
     const reason = getReorderReason(i, r.stock);
     const accentColor = kind === 'fastmover' ? 'var(--accent)' : 'var(--warn)';
 
-    // Calculate total received and total sold for this item (lifetime)
-    let totalReceived = 0;
-    let totalSold = 0;
-    let firstPurchaseTs = null;  // earliest IN transaction
-    let lastSaleTs = 0;          // latest OUT transaction
-    transactions.forEach(t => {
-      if (t.itemId !== i.id) return;
-      if (t.type === 'In') {
-        totalReceived += Number(t.qty);
-        if (firstPurchaseTs === null || t.ts < firstPurchaseTs) firstPurchaseTs = t.ts;
-      } else if (t.type === 'Out') {
-        totalSold += Number(t.qty);
-        if (t.ts > lastSaleTs) lastSaleTs = t.ts;
-      }
-    });
+    // PERFORMANCE: Use pre-built cache instead of looping all transactions.
+    // The cache is built ONCE for all items in O(N) time; per-card lookup is O(1).
+    const stats = getAutoStats(i.id);
+    const totalReceived = stats.totalReceived;
+    const totalSold = stats.totalSold;
+    const firstPurchaseTs = stats.firstPurchaseTs;
+    const lastSaleTs = stats.lastSaleTs;
     // Days span: from first purchase to last sale (or today if no sales yet)
     let daysSpan = 0;
     if (firstPurchaseTs !== null) {
