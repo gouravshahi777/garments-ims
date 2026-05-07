@@ -2404,6 +2404,38 @@
     pendingNewBrands = Array.from(newBrands.values());
     pendingNewSkus = Array.from(newSkus.values());
 
+    // ============== DUPLICATE DETECTION ==============
+    // Smart matching: SKU + Qty + Date + Type + Bill No.
+    // If all 5 match an existing transaction → it's a duplicate.
+    // Bill No. eliminates false positives (same SKU sold twice on same day = OK).
+    // Returns are also matched independently.
+    const existingTxKeys = new Set();
+    transactions.forEach(t => {
+      const dayKey = new Date(t.ts).toISOString().slice(0, 10);
+      // Strip [RETURN] tag from note for matching, keep bill no. only
+      const noteClean = (t.note || '').replace(/\s*\[RETURN\]/g, '').trim().toLowerCase();
+      // Key: itemId|qty|type|date|note(billNo)
+      existingTxKeys.add(`${t.itemId}|${t.qty}|${t.type}|${dayKey}|${noteClean}`);
+    });
+
+    parsedRows.forEach(r => {
+      r.isDuplicate = false;
+      if (!r.valid) return;
+      const itemId = r.item ? r.item.id : r.sku;
+      let dayKey = new Date().toISOString().slice(0, 10);
+      if (r.date) {
+        const parsed = parseDate(r.date);
+        if (parsed) dayKey = parsed.toISOString().slice(0, 10);
+      }
+      // Determine the txType the same way confirmUpload will
+      const txType = r.isReturn ? (uploadType === 'Out' ? 'In' : 'Out') : uploadType;
+      const noteClean = (r.note || '').trim().toLowerCase();
+      const key = `${itemId}|${r.qty}|${txType}|${dayKey}|${noteClean}`;
+      if (existingTxKeys.has(key)) {
+        r.isDuplicate = true;
+      }
+    });
+
     showPreview();
   }
 
@@ -2414,11 +2446,12 @@
     const total = parsedRows.length;
     const valid = parsedRows.filter(r => r.valid).length;
     const invalid = total - valid;
+    const duplicateCount = parsedRows.filter(r => r.valid && r.isDuplicate).length;
+    const newRowsCount = valid - duplicateCount;
     const returnCount = parsedRows.filter(r => r.valid && r.isReturn).length;
-    const normalCount = valid - returnCount;
     // Total qty: returns are counted in the OPPOSITE direction
     const totalQty = parsedRows.filter(r => r.valid).reduce((s, r) => {
-      return s + (r.isReturn ? 0 : r.qty);  // exclude returns from main "selling/receiving" count
+      return s + (r.isReturn ? 0 : r.qty);
     }, 0);
     const totalReturnQty = parsedRows.filter(r => r.valid && r.isReturn).reduce((s, r) => s + r.qty, 0);
 
@@ -2428,13 +2461,19 @@
     const hasNewEntities = newSupCount + newBrCount + newSkuCount > 0;
 
     document.getElementById('preview-summary-wrap').innerHTML = `
-      <div class="preview-summary">
+      <div class="preview-summary" ${duplicateCount > 0 ? 'style="grid-template-columns: repeat(4, 1fr);"' : ''}>
         <div class="preview-stat matched">
-          <div class="preview-stat-label">Will Import</div>
-          <div class="preview-stat-value">${valid}</div>
+          <div class="preview-stat-label">New Rows</div>
+          <div class="preview-stat-value">${newRowsCount}</div>
         </div>
+        ${duplicateCount > 0 ? `
+        <div class="preview-stat duplicate" style="border-left-color: var(--bad);">
+          <div class="preview-stat-label" style="color: var(--bad);">⚠️ Duplicates</div>
+          <div class="preview-stat-value" style="color: var(--bad);">${duplicateCount}</div>
+        </div>
+        ` : ''}
         <div class="preview-stat unmatched">
-          <div class="preview-stat-label">Will Skip</div>
+          <div class="preview-stat-label">Skip (Invalid)</div>
           <div class="preview-stat-value">${invalid}</div>
         </div>
         <div class="preview-stat">
@@ -2442,6 +2481,15 @@
           <div class="preview-stat-value">${fmt(totalQty)}</div>
         </div>
       </div>
+      ${duplicateCount > 0 ? `
+        <div style="background: rgba(248,81,73,0.08); border: 1px solid var(--bad); border-radius: 8px; padding: 12px 14px; margin-top: 10px; font-size: 12px;">
+          <strong style="color: var(--bad);">⚠️ ${duplicateCount} duplicate row${duplicateCount===1?'':'s'} detected</strong>
+          <div style="margin-top: 6px; color: var(--text); line-height: 1.5;">
+            These rows match existing transactions (same SKU + Quantity + Date + Bill No.) — they look like a re-upload of the same data.
+            <br>By default they will be <strong>SKIPPED</strong> to avoid double-counting your stock.
+          </div>
+        </div>
+      ` : ''}
       ${returnCount > 0 ? `
         <div style="background: rgba(88,166,255,0.08); border: 1px solid var(--info); border-radius: 8px; padding: 12px 14px; margin-top: 10px; font-size: 12px;">
           <strong style="color: var(--info);">↩ ${returnCount} return row${returnCount===1?'':'s'} detected</strong>
@@ -2465,17 +2513,29 @@
       ` : ''}
     `;
 
-    document.getElementById('upload-options-wrap').innerHTML = invalid > 0 ? `
-      <div style="font-size: 12px; color: var(--text-dim);">
-        <strong>${invalid}</strong> row${invalid===1?'':'s'} will be skipped. Valid rows still import.
-      </div>
-    ` : `
-      <div style="font-size: 12px; color: var(--good);">
-        ✓ All rows look good. Click "Confirm Import" to proceed.
-      </div>
+    // Skip duplicates option (default ON if duplicates detected)
+    document.getElementById('upload-options-wrap').innerHTML = `
+      ${duplicateCount > 0 ? `
+        <div style="display: flex; gap: 12px; align-items: center; padding: 10px 14px; background: var(--bg); border-radius: 6px; margin-bottom: 6px;">
+          <input type="checkbox" id="skip-duplicates-checkbox" checked style="width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent);" onchange="updateConfirmButton()" />
+          <label for="skip-duplicates-checkbox" style="font-size: 13px; color: var(--text); cursor: pointer; flex: 1;">
+            <strong>Skip ${duplicateCount} duplicate row${duplicateCount===1?'':'s'}</strong> (recommended)
+            <div style="font-size: 11px; color: var(--text-dim); margin-top: 2px;">Uncheck only if you want to import duplicates anyway (will double-count stock!)</div>
+          </label>
+        </div>
+      ` : ''}
+      ${invalid > 0 ? `
+        <div style="font-size: 12px; color: var(--text-dim);">
+          <strong>${invalid}</strong> invalid row${invalid===1?'':'s'} will be skipped. Valid rows still import.
+        </div>
+      ` : (duplicateCount === 0 ? `
+        <div style="font-size: 12px; color: var(--good);">
+          ✓ All rows look good — no duplicates detected. Click "Confirm Import" to proceed.
+        </div>
+      ` : '')}
     `;
 
-    // Show first 200 rows in the preview table
+    // Show first 200 rows in the preview table — duplicates highlighted RED
     document.getElementById('preview-table-wrap').innerHTML = `
       <table>
         <thead>
@@ -2494,8 +2554,13 @@
                   ? `${escapeHtml(r.derivedInfo.brand || r.derivedInfo.supplier || '')}${r.derivedInfo.item ? ' · '+escapeHtml(r.derivedInfo.item) : ''}${r.derivedInfo.shade ? ' · '+escapeHtml(r.derivedInfo.shade) : ''}${r.derivedInfo.size ? ' · '+escapeHtml(r.derivedInfo.size) : ''}`
                   : '<span style="color:var(--text-dim)">—</span>');
             let statusBadge;
+            let rowClass = r.valid ? '' : 'bad';
+            let rowStyle = '';
             if (!r.valid) {
               statusBadge = `<span class="row-status err" title="${escapeHtml(r.reason)}">Skip — ${escapeHtml(r.reason)}</span>`;
+            } else if (r.isDuplicate) {
+              statusBadge = `<span class="row-status" style="background: rgba(248,81,73,0.18); color: var(--bad); font-weight: 700;">⚠️ DUPLICATE</span>`;
+              rowStyle = 'background: rgba(248,81,73,0.06); border-left: 3px solid var(--bad);';
             } else if (r.isReturn) {
               statusBadge = `<span class="row-status" style="background: rgba(88,166,255,0.15); color: var(--info);">↩ Return → Stock IN</span>`;
             } else if (r.action === 'create_new') {
@@ -2506,7 +2571,7 @@
               statusBadge = `<span class="row-status ok">Will import</span>`;
             }
             return `
-              <tr class="preview-row ${r.valid ? '' : 'bad'}">
+              <tr class="preview-row ${rowClass}" style="${rowStyle}">
                 <td style="color:var(--text-dim); font-family:'Geist Mono',monospace; font-size:11px;">${r.rowNum}</td>
                 <td>
                   <div>${itemDisplay}</div>
@@ -2522,8 +2587,19 @@
       </table>
     `;
 
+    updateConfirmButton();
+  }
+
+  // Update confirm button text/state based on current skip-duplicates checkbox
+  function updateConfirmButton() {
+    const valid = parsedRows.filter(r => r.valid).length;
+    const duplicateCount = parsedRows.filter(r => r.valid && r.isDuplicate).length;
+    const skipCheckbox = document.getElementById('skip-duplicates-checkbox');
+    const skipDuplicates = skipCheckbox ? skipCheckbox.checked : false;
+    const willImport = skipDuplicates ? (valid - duplicateCount) : valid;
+
     const btn = document.getElementById('confirm-upload-btn');
-    if (valid === 0) {
+    if (willImport === 0) {
       btn.disabled = true;
       btn.style.opacity = '0.4';
       btn.style.cursor = 'not-allowed';
@@ -2532,37 +2608,35 @@
       btn.disabled = false;
       btn.style.opacity = '1';
       btn.style.cursor = 'pointer';
-      btn.textContent = `Confirm Import (${valid})`;
+      if (skipDuplicates && duplicateCount > 0) {
+        btn.textContent = `Confirm Import (${willImport} new, skip ${duplicateCount})`;
+      } else {
+        btn.textContent = `Confirm Import (${willImport})`;
+      }
     }
   }
 
   async function confirmUpload() {
-    const valid = parsedRows.filter(r => r.valid);
+    let valid = parsedRows.filter(r => r.valid);
     if (valid.length === 0) return;
 
-    // ============== DUPLICATE UPLOAD CHECK ==============
-    // Detect if this upload was already done by checking transactions for matching
-    // (itemId, qty, date) combinations. If 80%+ of rows already exist, warn user.
-    let duplicateCount = 0;
-    const recentTxKeys = new Set();
-    transactions.forEach(t => {
-      const dayKey = new Date(t.ts).toISOString().slice(0, 10);
-      recentTxKeys.add(`${t.itemId}|${t.qty}|${t.type}|${dayKey}`);
-    });
-    valid.forEach(r => {
-      const itemId = r.item ? r.item.id : r.sku;
-      let dayKey = new Date().toISOString().slice(0, 10);
-      if (r.date) {
-        const parsed = parseDate(r.date);
-        if (parsed) dayKey = parsed.toISOString().slice(0, 10);
+    // ============== APPLY SKIP DUPLICATES OPTION ==============
+    // Duplicates already detected in processRows. Filter them out if user
+    // chose to skip (default ON when duplicates exist).
+    const skipCheckbox = document.getElementById('skip-duplicates-checkbox');
+    const skipDuplicates = skipCheckbox ? skipCheckbox.checked : true;
+    const totalDuplicates = valid.filter(r => r.isDuplicate).length;
+    let skippedCount = 0;
+    if (skipDuplicates && totalDuplicates > 0) {
+      valid = valid.filter(r => !r.isDuplicate);
+      skippedCount = totalDuplicates;
+      if (valid.length === 0) {
+        alert('All rows are duplicates and were skipped. Nothing to import.');
+        return;
       }
-      const key = `${itemId}|${r.qty}|${uploadType}|${dayKey}`;
-      if (recentTxKeys.has(key)) duplicateCount++;
-    });
-
-    if (duplicateCount > 0) {
-      const pct = Math.round((duplicateCount / valid.length) * 100);
-      const msg = `⚠️ DUPLICATE WARNING\n\n${duplicateCount} out of ${valid.length} rows (${pct}%) look like they were already uploaded earlier.\n\nIf you import again, stock will be ${uploadType === 'In' ? 'ADDED' : 'REDUCED'} a SECOND time, making your numbers wrong.\n\nDo you want to continue anyway?\n\n(Click Cancel and check Activity tab if unsure)`;
+    } else if (totalDuplicates > 0) {
+      // User chose NOT to skip — extra confirmation since this could double-count
+      const msg = `⚠️ FINAL WARNING\n\n${totalDuplicates} duplicate rows will be imported anyway.\n\nThis will DOUBLE-COUNT your stock for these items!\n\nAre you absolutely sure?`;
       if (!confirm(msg)) return;
     }
 
@@ -2715,6 +2789,9 @@
     renderAll();
     switchTab('livestock');
     let successMsg = `✓ Imported ${valid.length} ${uploadType === 'In' ? 'purchase' : 'sale'} row${valid.length===1?'':'s'}`;
+    if (skippedCount > 0) {
+      successMsg += ` · Skipped ${skippedCount} duplicate${skippedCount===1?'':'s'}`;
+    }
     if (autoFixCount > 0) {
       successMsg += ` · Auto-fixed ${autoFixCount} SKUs (+${autoFixTotalPcs} pcs opening stock)`;
     }
