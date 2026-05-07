@@ -152,6 +152,24 @@
     background: rgba(217, 119, 6, 0.12); color: var(--warn);
     margin-right: 4px;
   }
+  /* Day-window toggle buttons for Fast Movers / Reorder filtering */
+  .day-toggle-wrap {
+    display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 4px; border-radius: 8px;
+  }
+  .day-toggle-label {
+    font-size: 11px; color: var(--text-dim); padding: 0 8px;
+    text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+  }
+  .day-toggle-btn {
+    padding: 6px 12px; border-radius: 5px; cursor: pointer;
+    font-size: 12px; font-weight: 600; color: var(--text-dim);
+    transition: all 0.15s; border: none; background: transparent;
+    font-family: inherit;
+  }
+  .day-toggle-btn:hover { color: var(--text); background: var(--panel-2); }
+  .day-toggle-btn.active { background: var(--accent); color: #ffffff; }
 
   .pill {
     display: inline-block; padding: 3px 10px; border-radius: 100px;
@@ -710,6 +728,17 @@
       <button class="btn btn-ghost btn-sm" onclick="downloadReorderXLSX2('regular')" title="Simple 8-column format for suppliers">↓ Download Excel2</button>
       <span style="color: var(--text-dim); font-size:12px" id="reorder-count"></span>
     </div>
+    <!-- Day-window toggle: changes which items count as fast movers (and thus excluded from this list) -->
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
+      <div class="day-toggle-wrap">
+        <span class="day-toggle-label">Window:</span>
+        <button class="day-toggle-btn" data-days="20" onclick="setReorderDays(20)">20 days</button>
+        <button class="day-toggle-btn" data-days="30" onclick="setReorderDays(30)">30 days</button>
+        <button class="day-toggle-btn" data-days="45" onclick="setReorderDays(45)">45 days</button>
+        <button class="day-toggle-btn" data-days="60" onclick="setReorderDays(60)">60 days</button>
+        <button class="day-toggle-btn" data-days="90" onclick="setReorderDays(90)">90 days</button>
+      </div>
+    </div>
     <div style="font-size:12px; color: var(--text-dim); margin-bottom:14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; border-left: 3px solid var(--warn);">
       <strong>Reorder List:</strong> items needing replenishment due to stock issues — out of stock, low stock, below reorder point. Fast-selling items (75%+ sold) appear in Fast Movers tab instead.
     </div>
@@ -729,6 +758,17 @@
       <button class="btn btn-good btn-sm" onclick="downloadReorderXLSX('fastmover')" style="margin-left:auto" title="Detailed format with all info">↓ Download Excel</button>
       <button class="btn btn-ghost btn-sm" onclick="downloadReorderXLSX2('fastmover')" title="Simple 8-column format for suppliers">↓ Download Excel2</button>
       <span style="color: var(--text-dim); font-size:12px" id="fm-count"></span>
+    </div>
+    <!-- Day-window toggle: lets user instantly check fast movers across different time windows -->
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
+      <div class="day-toggle-wrap">
+        <span class="day-toggle-label">Window:</span>
+        <button class="day-toggle-btn" data-days="20" onclick="setFastMoverDays(20)">20 days</button>
+        <button class="day-toggle-btn" data-days="30" onclick="setFastMoverDays(30)">30 days</button>
+        <button class="day-toggle-btn" data-days="45" onclick="setFastMoverDays(45)">45 days</button>
+        <button class="day-toggle-btn" data-days="60" onclick="setFastMoverDays(60)">60 days</button>
+        <button class="day-toggle-btn" data-days="90" onclick="setFastMoverDays(90)">90 days</button>
+      </div>
     </div>
     <div style="font-size:12px; color: var(--text-dim); margin-bottom:14px; padding: 10px 12px; background: var(--panel-2); border-radius: 8px; border-left: 3px solid var(--accent);" id="fm-explainer">
       <strong>⚡ Fast movers:</strong> items where the velocity threshold has been hit on the last batch.
@@ -2870,7 +2910,8 @@
     const supId = supEl ? supEl.value : 'all';
     const brId  = brEl  ? brEl.value  : 'all';
 
-    const { regular, fastMovers } = getReorderBuckets(supId, brId);
+    const days = kind === 'fastmover' ? getFastMoverWindow() : getReorderWindow();
+    const { regular, fastMovers } = getReorderBuckets(supId, brId, days);
     const list = kind === 'fastmover' ? fastMovers : regular;
 
     if (list.length === 0) {
@@ -3176,7 +3217,8 @@
     const supId = supEl ? supEl.value : 'all';
     const brId  = brEl  ? brEl.value  : 'all';
 
-    const { regular, fastMovers } = getReorderBuckets(supId, brId);
+    const days = kind === 'fastmover' ? getFastMoverWindow() : getReorderWindow();
+    const { regular, fastMovers } = getReorderBuckets(supId, brId, days);
     const list = kind === 'fastmover' ? fastMovers : regular;
 
     if (list.length === 0) {
@@ -3369,8 +3411,10 @@
     txByItemVersion = dataVersion;
   }
 
-  function getVelocityCheck(itemId) {
-    const windowDays = Number(settings.velocityDays) || 20;
+  function getVelocityCheck(itemId, overrideDays) {
+    // overrideDays — optional override for the time window (used by tab filters)
+    // Falls back to settings.velocityDays (default 20)
+    const windowDays = Number(overrideDays) > 0 ? Number(overrideDays) : (Number(settings.velocityDays) || 20);
     const thresholdPct = Number(settings.velocityPct) || 75;
 
     if (txByItemVersion !== dataVersion || !txByItemCache) {
@@ -3595,6 +3639,8 @@
     fillBrandDropdown('act-brand', document.getElementById('act-supplier').value);
     // Populate Group dropdown for Live Stock from unique categories
     fillGroupDropdown('ls-group');
+    // Initialize day-window toggle buttons — highlight the default (settings.velocityDays, e.g. 20)
+    initDayToggleButtons();
     // Settings inputs
     const setVd = document.getElementById('set-vd');
     const setVp = document.getElementById('set-vp');
@@ -4052,30 +4098,26 @@
 
   // Returns { regular, fastMovers } — STRICT separation, no duplication.
   // Each item appears in EXACTLY ONE tab.
-  function getReorderBuckets(supId, brId) {
+  // overrideDays — optional override for fast mover time window (used by tab filters)
+  function getReorderBuckets(supId, brId, overrideDays) {
     const filtered = applyFilters(supId, brId, '');
     const all = filtered.map(i => {
       const stock = getStock(i.id);
       const status = getStatus(i, stock);
-      const v = getVelocityCheck(i.id);
+      // Pass overrideDays so fast mover detection respects the user's selection
+      const v = getVelocityCheck(i.id, overrideDays);
       return { item: i, stock, status, velocity: v };
     });
 
-    // FAST MOVERS: items that sold 75% (or threshold%) STRICTLY BEFORE 20 days (or windowDays).
-    // Example: 75% sold in 15 days = fast mover
-    //          75% sold in 20 days = NOT fast mover (goes to regular reorder)
-    // These ONLY appear in Fast Movers tab, NOT in Reorder List.
+    // FAST MOVERS: items that sold X% in less than the selected window.
     const fastMovers = all.filter(r => r.velocity.isTrueFastMover);
 
     // REORDER LIST: items that need ordering BUT are NOT fast movers.
     // - Out of stock (with no fast-mover trigger)
     // - Below reorder point (with no fast-mover trigger)
     // - Low stock (with no fast-mover trigger)
-    // - Items that hit 75% but at exactly the 20-day window (slow-fast — borderline)
     const regular = all.filter(r => {
-      // Skip if this is a true fast mover (goes to Fast Movers tab only)
       if (r.velocity.isTrueFastMover) return false;
-      // Otherwise include if it needs ordering for stock reasons
       return r.status === 'outofstock' ||
              r.status === 'reorder' ||
              r.status === 'low';
@@ -4087,13 +4129,62 @@
     return { regular, fastMovers };
   }
 
+  // ============== DAY-WINDOW STATE ==============
+  // Active day window for Fast Mover / Reorder filtering.
+  // null = use settings default (settings.velocityDays, currently 20)
+  // Number = override (20/30/45/60/90)
+  let fastMoverActiveDays = null;  // for Fast Movers tab
+  let reorderActiveDays = null;    // for Reorder List tab
+
+  // Set the active day window for Fast Movers tab and re-render
+  function setFastMoverDays(days) {
+    fastMoverActiveDays = Number(days) || null;
+    // Highlight the active button
+    document.querySelectorAll('#tab-fastmovers .day-toggle-btn').forEach(btn => {
+      btn.classList.toggle('active', Number(btn.dataset.days) === fastMoverActiveDays);
+    });
+    renderFastMovers();
+  }
+
+  // Set the active day window for Reorder List tab and re-render
+  function setReorderDays(days) {
+    reorderActiveDays = Number(days) || null;
+    document.querySelectorAll('#tab-reorder .day-toggle-btn').forEach(btn => {
+      btn.classList.toggle('active', Number(btn.dataset.days) === reorderActiveDays);
+    });
+    renderReorder();
+  }
+
+  // Helper: get effective day window for each tab (respects user's toggle, falls back to settings)
+  function getFastMoverWindow() {
+    return fastMoverActiveDays || (Number(settings.velocityDays) || 20);
+  }
+  function getReorderWindow() {
+    return reorderActiveDays || (Number(settings.velocityDays) || 20);
+  }
+
+  // Highlight the active day-toggle button on each tab.
+  // If user hasn't picked one, highlight the default (settings.velocityDays).
+  function initDayToggleButtons() {
+    const fmDays = fastMoverActiveDays || Number(settings.velocityDays) || 20;
+    const rDays = reorderActiveDays || Number(settings.velocityDays) || 20;
+    document.querySelectorAll('#tab-fastmovers .day-toggle-btn').forEach(btn => {
+      btn.classList.toggle('active', Number(btn.dataset.days) === fmDays);
+    });
+    document.querySelectorAll('#tab-reorder .day-toggle-btn').forEach(btn => {
+      btn.classList.toggle('active', Number(btn.dataset.days) === rDays);
+    });
+  }
+
   function renderReorder() {
     const supId = document.getElementById('reorder-supplier').value;
     const brId = document.getElementById('reorder-brand').value;
-    const { regular } = getReorderBuckets(supId, brId);
+    const days = getReorderWindow();
+    const { regular } = getReorderBuckets(supId, brId, days);
 
+    const windowSuffix = reorderActiveDays ? ` (${days}-day window)` : '';
     document.getElementById('reorder-count').textContent =
-      regular.length === 0 ? 'Nothing to reorder' : `${regular.length} SKU${regular.length===1?'':'s'} need ordering`;
+      regular.length === 0 ? 'Nothing to reorder' : `${regular.length} SKU${regular.length===1?'':'s'} need ordering${windowSuffix}`;
 
     const wrap = document.getElementById('reorder-content');
     if (regular.length === 0) {
@@ -4106,20 +4197,22 @@
   function renderFastMovers() {
     const supId = document.getElementById('fm-supplier').value;
     const brId = document.getElementById('fm-brand').value;
-    const { fastMovers } = getReorderBuckets(supId, brId);
+    const days = getFastMoverWindow();
+    const { fastMovers } = getReorderBuckets(supId, brId, days);
 
-    // Update the explainer with current settings
+    // Update the explainer with current window
     const expl = document.getElementById('fm-explainer');
     if (expl) {
-      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% of the last batch sold in <strong>less than ${settings.velocityDays} days</strong>. These items sell super fast — order more next time! Suggested order = last batch × ${settings.fastMoverMultiplier}.`;
+      expl.innerHTML = `<strong>⚡ Fast movers:</strong> items where ${settings.velocityPct}% sold in <strong>less than ${days} days</strong>. These items sell super fast — order more next time! Suggested order = last batch × ${settings.fastMoverMultiplier}.`;
     }
 
+    const windowSuffix = fastMoverActiveDays ? ` (${days}-day window)` : '';
     document.getElementById('fm-count').textContent =
-      fastMovers.length === 0 ? 'No fast movers right now' : `${fastMovers.length} fast mover${fastMovers.length===1?'':'s'}`;
+      fastMovers.length === 0 ? `No fast movers in ${days}-day window` : `${fastMovers.length} fast mover${fastMovers.length===1?'':'s'}${windowSuffix}`;
 
     const wrap = document.getElementById('fm-content');
     if (fastMovers.length === 0) {
-      wrap.innerHTML = `<div class="table-wrap"><div class="empty"><div class="empty-icon">✓</div>Nothing is selling fast enough to trigger the velocity alert.</div></div>`;
+      wrap.innerHTML = `<div class="table-wrap"><div class="empty"><div class="empty-icon">✓</div>Nothing is selling fast enough in the ${days}-day window. Try a larger window above.</div></div>`;
       return;
     }
     wrap.innerHTML = `<div class="reorder-grid">${fastMovers.map(r => renderReorderCard(r, 'fastmover')).join('')}</div>`;
