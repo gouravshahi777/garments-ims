@@ -2930,7 +2930,7 @@
       const i = r.item;
       const b = getBrand(i.brandId);
       const sup = getItemSupplier(i);
-      const orderQty = Math.ceil(getReorderQty(i, r.stock));
+      const orderQty = Math.max(1, Math.ceil(getReorderQty(i, r.stock)));
 
       // PERFORMANCE: Use pre-built cache instead of looping all transactions per row
       const stats = getAutoStats(i.id);
@@ -3205,7 +3205,7 @@
     const rows = list.map(r => {
       const i = r.item;
       const b = getBrand(i.brandId);
-      const orderQty = Math.ceil(getReorderQty(i, r.stock));
+      const orderQty = Math.max(1, Math.ceil(getReorderQty(i, r.stock)));
       return [
         i.id,
         i.name || '',
@@ -3533,20 +3533,37 @@
   // - Fast movers (velocity-triggered): the LAST received batch × multiplier (default 2x)
   //   "You sold most of 4 pieces fast → next time order 8."
   // We always honor MOQ as a floor.
+  // BULLETPROOF: This function is GUARANTEED to never return 0 or negative.
+  // Multiple safety layers in case any of the input values are NaN/null/undefined/0.
   function getReorderQty(item, stock) {
     // Use effective values (manual if set, auto-calculated if not)
-    const effMOQ = getEffectiveMOQ(item);
-    const effMax = getEffectiveMax(item);
-    const baseRefill = Math.max(effMOQ, effMax - stock);
+    const effMOQ = Number(getEffectiveMOQ(item)) || 0;
+    const effMax = Number(getEffectiveMax(item)) || 0;
+    const safeStock = Number(stock) || 0;
+    const baseRefill = Math.max(effMOQ, effMax - safeStock);
     const v = getVelocityCheck(item.id);
+    let qty = baseRefill;
     if (v.triggered && v.batches.length > 0) {
       const lastBatch = v.batches[v.batches.length - 1];
       const mult = Number(settings.fastMoverMultiplier) || 2;
-      const fastQty = Number(lastBatch.received) * mult;
-      // Take the larger of the two — never order less than what refilling needs
-      return Math.max(baseRefill, fastQty);
+      const fastQty = (Number(lastBatch.received) || 0) * mult;
+      qty = Math.max(baseRefill, fastQty);
     }
-    return baseRefill;
+    // Layer 1: For SKUs that were auto-created from sale-only data
+    // (no purchase history → all auto-stats are 0), getReorderQty would return 0
+    // making the suggestion useless. As a fallback, suggest the total quantity that was
+    // sold for this SKU — that's a sensible "what we usually need" estimate.
+    if (qty <= 0 || isNaN(qty)) {
+      const stats = getAutoStats(item.id);
+      const soldQty = Number(stats.totalSold) || 0;
+      qty = Math.ceil(soldQty);
+    }
+    // Layer 2: Absolute final guarantee — minimum 1 piece, never 0/NaN/negative.
+    // This handles every possible edge case (no sales, no purchases, deleted data, etc.)
+    if (!qty || qty <= 0 || isNaN(qty) || !isFinite(qty)) {
+      qty = 1;
+    }
+    return Math.max(1, Math.ceil(qty));
   }
   function getDaysOfCover(item, stock) {
     if (!item.adc || item.adc <= 0) return Infinity;
@@ -4218,7 +4235,7 @@
 
   function renderReorderCard(r, kind) {
     const i = r.item;
-    const rq = Math.ceil(getReorderQty(i, r.stock));
+    const rq = Math.max(1, Math.ceil(getReorderQty(i, r.stock)));
     const b = getBrand(i.brandId);
     const sup = getItemSupplier(i);
     const v = r.velocity;
