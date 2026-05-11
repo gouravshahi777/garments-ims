@@ -528,6 +528,15 @@
     </div>
   </div>
 
+  <!-- GLOBAL YEAR FILTER — affects KPIs, Activity. Reorder/FastMover use all data. -->
+  <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; padding: 10px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;">
+    <span style="font-size:12px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.05em;">📅 Year Filter:</span>
+    <select id="global-year-filter" class="select" onchange="onGlobalYearChange()" style="min-width:140px;">
+      <option value="all">All Years</option>
+    </select>
+    <span style="font-size:11px; color:var(--text-dim); margin-left:8px;" id="global-year-info">Showing all data</span>
+  </div>
+
   <div class="tabs">
     <button class="tab active" data-tab="livestock" onclick="switchTab('livestock')">Live Stock</button>
     <button class="tab" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
@@ -3248,6 +3257,53 @@
 
   function bumpDataVersion() { dataVersion++; }
 
+  // ============== GLOBAL YEAR FILTER ==============
+  // null = "All Years" (no filter)
+  // Number (e.g. 2026) = show only transactions/data from that calendar year
+  // Affects: Live Stock KPIs, Dashboard KPIs, Activity tab
+  // Does NOT affect: Reorder List, Fast Movers (those use lifetime data for accuracy)
+  let globalYearFilter = null;
+
+  // Check if a transaction is in the selected year (or all years if no filter)
+  function txInYear(t) {
+    if (!globalYearFilter) return true;
+    const txYear = new Date(t.ts).getFullYear();
+    return txYear === globalYearFilter;
+  }
+
+  // Populate year dropdown from transaction data
+  function fillGlobalYearDropdown() {
+    const sel = document.getElementById('global-year-filter');
+    if (!sel) return;
+    const cur = sel.value;
+    const yearSet = new Set();
+    transactions.forEach(t => {
+      const y = new Date(t.ts).getFullYear();
+      if (y >= 2020 && y <= 2099) yearSet.add(y);  // sanity bounds
+    });
+    const years = Array.from(yearSet).sort((a, b) => b - a);  // newest first
+    sel.innerHTML = '<option value="all">All Years</option>' +
+      years.map(y => `<option value="${y}">${y}</option>`).join('');
+    // Restore selection
+    sel.value = years.includes(Number(cur)) ? cur : 'all';
+  }
+
+  // Handler when user changes year dropdown
+  function onGlobalYearChange() {
+    const sel = document.getElementById('global-year-filter');
+    const val = sel.value;
+    globalYearFilter = val === 'all' ? null : Number(val);
+    const info = document.getElementById('global-year-info');
+    if (info) {
+      info.textContent = globalYearFilter
+        ? `Showing ${globalYearFilter} only (KPIs & Activity)`
+        : 'Showing all data';
+    }
+    // Bump version so caches rebuild for filtered view
+    bumpDataVersion();
+    renderAll();
+  }
+
   function buildStockCache() {
     const cache = new Map();
     // Initialize with startStock
@@ -3372,6 +3428,45 @@
       firstPurchaseTs: null, lastSaleTs: 0, lastBatchQty: 0, lastBatchTs: 0,
       avgDailySale: 0, autoMaxLevel: 0, autoMOQ: 0, autoReorderThreshold: 0
     };
+  }
+
+  // ============== YEAR-FILTERED STATS CACHE ==============
+  // Separate cache that respects globalYearFilter. Used by Live Stock KPIs and
+  // Dashboard KPIs. The main autoStats cache (above) stays UNFILTERED so that
+  // Reorder/Fast Movers continue to use lifetime data for correct decisions.
+  let filteredStatsCache = null;
+  let filteredStatsVersion = -1;
+  let filteredStatsYear = null;
+
+  function buildFilteredStatsCache() {
+    filteredStatsCache = new Map();
+    filteredStatsVersion = dataVersion;
+    filteredStatsYear = globalYearFilter;
+    items.forEach(i => {
+      filteredStatsCache.set(i.id, { received: 0, sold: 0, returns: 0 });
+    });
+    transactions.forEach(t => {
+      if (!txInYear(t)) return;  // skip if outside selected year
+      const s = filteredStatsCache.get(t.itemId);
+      if (!s) return;
+      const isReturn = t.note && (t.note.includes('[RETURN]') || t.note === 'RETURN' || t.note.endsWith(' RETURN'));
+      if (t.type === 'In') {
+        if (isReturn) s.returns += Number(t.qty);
+        else s.received += Number(t.qty);
+      } else if (t.type === 'Out') {
+        if (isReturn) s.received -= Number(t.qty);
+        else s.sold += Number(t.qty);
+      }
+    });
+  }
+
+  // Get year-filtered stats for an item.
+  // If no year filter is active, returns same as getAutoStats() (mapped to flat fields).
+  function getFilteredStats(itemId) {
+    if (filteredStatsVersion !== dataVersion || filteredStatsYear !== globalYearFilter || !filteredStatsCache) {
+      buildFilteredStatsCache();
+    }
+    return filteredStatsCache.get(itemId) || { received: 0, sold: 0, returns: 0 };
   }
 
   // Helper to get effective Max Level (manual or auto)
@@ -3653,6 +3748,8 @@
     fillBrandDropdown('act-brand', document.getElementById('act-supplier').value);
     // Populate Group dropdown for Live Stock from unique categories
     fillGroupDropdown('ls-group');
+    // Populate global year filter dropdown from transactions
+    fillGlobalYearDropdown();
     // Initialize day-window toggle buttons — highlight the default (settings.velocityDays, e.g. 20)
     initDayToggleButtons();
     // Settings inputs
@@ -3744,28 +3841,40 @@
       lsTotalOpening += Number(i.startStock || 0);
     });
 
-    // PERFORMANCE: Use pre-built autoStats cache instead of looping all transactions.
-    // Old code looped 57K+ tx for every render — froze browser. Cache gives O(items) lookup.
+    // PERFORMANCE: Use pre-built cache. If year filter active, use year-filtered stats.
+    // Without year filter, behaves identical to before (uses lifetime totals).
     visible.forEach(i => {
-      const s = getAutoStats(i.id);
-      lsTotalReceived += s.totalReceived;
-      lsTotalSold += s.totalSold;
-      lsTotalReturns += s.totalReturns;
+      if (globalYearFilter) {
+        const s = getFilteredStats(i.id);
+        lsTotalReceived += s.received;
+        lsTotalSold += s.sold;
+        lsTotalReturns += s.returns;
+      } else {
+        const s = getAutoStats(i.id);
+        lsTotalReceived += s.totalReceived;
+        lsTotalSold += s.totalSold;
+        lsTotalReturns += s.totalReturns;
+      }
     });
 
-    // Add opening stock to Total Received — it's all stock that came IN to the shop
-    lsTotalReceived += lsTotalOpening;
+    // Add opening stock to Total Received — ONLY if no year filter active.
+    // Opening stock is pre-existing inventory (before transactions began) — it's not
+    // tied to any specific calendar year, so we exclude it from year-filtered views.
+    if (!globalYearFilter) {
+      lsTotalReceived += lsTotalOpening;
+    }
 
     // Sold % = (Total Sold / Total Received) — how much of what we bought has been sold
     const lsSoldPct = lsTotalReceived > 0 ? Math.round((lsTotalSold / lsTotalReceived) * 100) : 0;
 
+    const yearSuffix = globalYearFilter ? ` · ${globalYearFilter}` : '';
     document.getElementById('ls-kpi-received').textContent = fmt(lsTotalReceived, 0);
     document.getElementById('ls-kpi-stock').textContent = fmt(lsTotalStock, 0);
     document.getElementById('ls-kpi-sold').textContent = fmt(lsTotalSold, 0);
     document.getElementById('ls-kpi-return').textContent = fmt(lsTotalReturns, 0);
     document.getElementById('ls-kpi-pct').textContent = lsSoldPct + '%';
     document.getElementById('ls-kpi-pct-meta').textContent =
-      `${fmt(lsTotalSold, 0)} of ${fmt(lsTotalReceived, 0)} sold`;
+      `${fmt(lsTotalSold, 0)} of ${fmt(lsTotalReceived, 0)} sold${yearSuffix}`;
     // ============== END KPIs ==============
 
     const tbody = document.getElementById('ls-tbody');
@@ -3821,11 +3930,17 @@
       else if (status === 'reorder' || status === 'low') reorderCount++;
       totalValue += s * (Number(i.cost) || 0);
     });
-    // Calculate overall sold % from cached stats (much faster than looping transactions)
+    // Calculate overall sold % from cached stats (respects year filter)
     items.forEach(i => {
-      const s = getAutoStats(i.id);
-      totalReceived += s.totalReceived;
-      totalSold += s.totalSold;
+      if (globalYearFilter) {
+        const s = getFilteredStats(i.id);
+        totalReceived += s.received;
+        totalSold += s.sold;
+      } else {
+        const s = getAutoStats(i.id);
+        totalReceived += s.totalReceived;
+        totalSold += s.totalSold;
+      }
     });
     const overallSoldPct = totalReceived > 0 ? Math.round((totalSold / totalReceived) * 100) : 0;
 
@@ -4307,6 +4422,7 @@
     const allRows = transactions.slice().sort((a,b) => b.ts - a.ts)
       .map(t => ({ ...t, item: items.find(i => i.id === t.itemId) }))
       .filter(t => t.item)
+      .filter(t => txInYear(t))  // Apply global year filter
       .filter(t => {
         const b = getBrand(t.item.brandId);
         if (!b) return false;
