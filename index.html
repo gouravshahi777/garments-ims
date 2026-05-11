@@ -1226,26 +1226,74 @@
     bumpDataVersion(); // invalidate stock cache
     // Queue saves so concurrent updates don't race
     saveQueue = saveQueue.then(async () => {
-      try {
-        const dataPayload = { suppliers, brands, items, transactions, settings };
-        // Upsert (update if exists, insert if not) by shop_id
-        const { error } = await db
-          .from('shops')
-          .update({ data: dataPayload })
-          .eq('shop_id', SHOP_DOC);
-        if (error) throw error;
-        console.log('✓ Saved to Supabase');
-        lastSaveOk = true;
-      } catch (err) {
-        console.error('Supabase save failed:', err);
-        lastSaveOk = false;
-        if (err.message && err.message.toLowerCase().includes('payload')) {
-          toast('⚠️ Data bahut zyada hai — kuch purana data delete karo');
-        } else if (err.code === 'PGRST301' || (err.message && err.message.includes('permission'))) {
-          toast('⚠️ Permission denied — Supabase RLS check karo');
-        } else {
-          toast('⚠️ Cloud save fail ho gaya — internet check karo');
+      const dataPayload = { suppliers, brands, items, transactions, settings };
+
+      // Size check upfront — warn user before attempting save
+      const payloadSize = JSON.stringify(dataPayload).length;
+      const sizeMB = payloadSize / (1024 * 1024);
+      console.log(`💾 Saving to Supabase: ${sizeMB.toFixed(2)} MB`);
+
+      // ============== RETRY LOGIC ==============
+      // Big payloads can fail due to:
+      //   1. Network timeout (large transfers)
+      //   2. Temporary Supabase server slowness
+      //   3. Brief internet hiccup
+      // Solution: Try up to 3 times with increasing delays (1s, 3s, 5s)
+      // before giving up. Most transient errors clear within seconds.
+      const MAX_RETRIES = 3;
+      const delays = [1000, 3000, 5000];  // ms between retries
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (attempt > 1) {
+            console.log(`🔄 Retry ${attempt}/${MAX_RETRIES} after ${delays[attempt-2]}ms delay...`);
+            toast(`🔄 Retry ${attempt}/${MAX_RETRIES} — cloud save ko time de rahe hain...`);
+            await new Promise(r => setTimeout(r, delays[attempt-2]));
+          }
+
+          // Add a 60s timeout — if Supabase doesn't respond in 60s, abort and retry
+          const savePromise = db
+            .from('shops')
+            .update({ data: dataPayload })
+            .eq('shop_id', SHOP_DOC);
+
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('TIMEOUT')), 60000)
+          );
+
+          const { error } = await Promise.race([savePromise, timeoutPromise]);
+          if (error) throw error;
+
+          console.log(`✓ Saved to Supabase (attempt ${attempt}, ${sizeMB.toFixed(2)} MB)`);
+          lastSaveOk = true;
+          return;  // Success — exit retry loop
+        } catch (err) {
+          lastError = err;
+          console.error(`Supabase save attempt ${attempt} failed:`, err);
+          // For permission errors and payload-too-big, don't retry — won't help
+          if (err.code === 'PGRST301' || (err.message && err.message.includes('permission'))) {
+            break;
+          }
+          if (err.message && (err.message.toLowerCase().includes('payload too large') || err.message.toLowerCase().includes('row size'))) {
+            break;
+          }
         }
+      }
+
+      // All retries failed — show appropriate error
+      lastSaveOk = false;
+      const errMsg = (lastError && lastError.message) || 'Unknown error';
+      console.error('All save attempts failed. Last error:', lastError);
+
+      if (errMsg.toLowerCase().includes('payload') || errMsg.toLowerCase().includes('row size')) {
+        toast(`⚠️ Data ${sizeMB.toFixed(1)} MB — Supabase 16 MB limit ke paas. Backup le ke purana data delete karo.`);
+      } else if (lastError && (lastError.code === 'PGRST301' || errMsg.includes('permission'))) {
+        toast('⚠️ Permission denied — Supabase RLS settings check karo');
+      } else if (errMsg === 'TIMEOUT') {
+        toast(`⚠️ ${MAX_RETRIES} retries fail hue — internet bahut slow hai. WiFi check karo aur dobara try karo.`);
+      } else {
+        toast(`⚠️ Save fail (${MAX_RETRIES} tries) — ${errMsg.slice(0, 80)}`);
       }
     });
     return saveQueue;
