@@ -4757,3 +4757,405 @@
   setupDropZone();
   setupAuthListener();
 </script>
+<!--
+  ============================================================
+  📋 CONNECTION FIX — PASTE AT END OF YOUR index.html
+  ============================================================
+
+  STEPS:
+  1. github.com/gouravshahi777/garments-ims kholo
+  2. index.html file pe click karo
+  3. Right side pencil icon (✏️) "Edit this file"
+  4. Ctrl + End dabao (file ke end mein jao)
+  5. Last line dhundo:  </script>
+  6. Uske BAAD, ye saara content paste karo (start to end)
+  7. Niche green button "Commit changes" 2 baar dabao
+  8. 1-2 minute wait karo, fir website refresh karo
+
+  Agar kuch galat ho jaye:
+  - Same file edit karo
+  - "<!-- START PATCH -->" se "<!-- END PATCH -->" tak ka saara content delete kar do
+  - Commit kar do
+  - App vapas pehle jaisi ho jayegi
+  ============================================================
+-->
+
+<!-- START PATCH -->
+<script>
+/**
+ * Retail Garments IMS — Connection & Reliability Fixes
+ * Inline patch — kuch external file ki zaroorat nahi.
+ */
+(function() {
+  'use strict';
+
+  console.log('🔧 Connection-fixes patch loading...');
+
+  // ================================================================
+  // 1. CONNECTION BANNER STYLES
+  // ================================================================
+  if (!document.getElementById('conn-fix-styles')) {
+    const style = document.createElement('style');
+    style.id = 'conn-fix-styles';
+    style.textContent = `
+      #conn-banner {
+        position: fixed; top: 0; left: 0; right: 0; z-index: 9998;
+        padding: 13px 18px;
+        display: flex; align-items: center; gap: 12px;
+        justify-content: center; flex-wrap: wrap;
+        font-family: 'Geist', 'Arial', sans-serif;
+        font-size: 13px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+        animation: connBannerSlide 0.3s ease-out;
+      }
+      #conn-banner.error {
+        background: linear-gradient(135deg, #fee2e2, #fecaca);
+        border-bottom: 2px solid #dc2626;
+        color: #991b1b;
+      }
+      #conn-banner.warn {
+        background: linear-gradient(135deg, #fef3c7, #fde68a);
+        border-bottom: 2px solid #d97706;
+        color: #92400e;
+      }
+      #conn-banner.info {
+        background: linear-gradient(135deg, #dbeafe, #bfdbfe);
+        border-bottom: 2px solid #2563eb;
+        color: #1e40af;
+      }
+      #conn-banner.success {
+        background: linear-gradient(135deg, #d1fae5, #a7f3d0);
+        border-bottom: 2px solid #059669;
+        color: #064e3b;
+      }
+      #conn-banner .banner-icon { font-size: 20px; flex-shrink: 0; }
+      #conn-banner .banner-msg { flex: 1; max-width: 600px; line-height: 1.45; }
+      #conn-banner .banner-msg strong { font-weight: 700; display: block; margin-bottom: 2px; }
+      #conn-banner button {
+        border: none; padding: 7px 14px; border-radius: 6px;
+        font-weight: 600; cursor: pointer; font-family: inherit;
+        font-size: 12px; white-space: nowrap;
+      }
+      #conn-banner button.btn-primary { background: currentColor; color: white; }
+      #conn-banner button.btn-primary:hover { opacity: 0.85; }
+      #conn-banner button.btn-ghost {
+        background: transparent; border: 1px solid currentColor;
+      }
+      #conn-banner button.btn-ghost:hover { background: rgba(0,0,0,0.05); }
+      @keyframes connBannerSlide {
+        from { transform: translateY(-100%); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+      }
+      body.has-conn-banner { padding-top: 60px; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function showConnectionBanner(htmlMsg, type, showRetry) {
+    type = type || 'error';
+    showRetry = showRetry !== false;
+    hideConnectionBanner();
+    const banner = document.createElement('div');
+    banner.id = 'conn-banner';
+    banner.className = type;
+    const iconMap = { error: '⚠️', warn: '⚡', info: 'ℹ️', success: '✅' };
+    const icon = iconMap[type] || 'ℹ️';
+    banner.innerHTML =
+      '<span class="banner-icon">' + icon + '</span>' +
+      '<div class="banner-msg">' + htmlMsg + '</div>' +
+      (showRetry ? '<button class="btn-primary" onclick="window.__connFix.retryConnection()">🔄 Retry</button>' : '') +
+      '<button class="btn-ghost" onclick="window.__connFix.hideConnectionBanner()">Dismiss</button>';
+    document.body.prepend(banner);
+    document.body.classList.add('has-conn-banner');
+  }
+
+  function hideConnectionBanner() {
+    const b = document.getElementById('conn-banner');
+    if (b) b.remove();
+    document.body.classList.remove('has-conn-banner');
+  }
+
+  // ================================================================
+  // 2. LIVE CLOUD STATUS BADGE
+  // ================================================================
+  function updateConnectionStatus(online) {
+    const el = document.getElementById('cloud-status');
+    if (!el) return;
+    if (online) {
+      el.style.background = 'rgba(63,185,80,0.15)';
+      el.style.color = 'var(--good)';
+      el.textContent = '☁ Cloud Connected';
+      el.title = 'Cloud se connected. Data sync ho raha hai.';
+    } else {
+      el.style.background = 'rgba(248,81,73,0.15)';
+      el.style.color = 'var(--bad)';
+      el.textContent = '⚠ Offline';
+      el.title = 'Cloud se disconnect. Changes save nahi honge.';
+    }
+  }
+
+  // ================================================================
+  // 3. ALERT HIJACK — friendly banners instead of scary popups
+  // ================================================================
+  const originalAlert = window.alert.bind(window);
+  const FRIENDLY_PATTERNS = [
+    /Cloud se data load nahi hua/i,
+    /Supabase ready nahi/i,
+    /Cloud save fail/i,
+    /Failed to fetch/i,
+    /Supabase connect nahi/i,
+    /TypeError.*fetch/i
+  ];
+
+  window.alert = function(msg) {
+    if (typeof msg === 'string') {
+      const isFriendly = FRIENDLY_PATTERNS.some(p => p.test(msg));
+      if (isFriendly) {
+        console.log('[connection-fixes] Intercepted alert:', msg.slice(0, 100));
+        showConnectionBanner(buildFriendlyMessage(msg), 'error', true);
+        updateConnectionStatus(false);
+        return;
+      }
+    }
+    return originalAlert(msg);
+  };
+
+  function buildFriendlyMessage(rawMsg) {
+    if (/timeout|slow|fetch/i.test(rawMsg)) {
+      return '<strong>Internet bahut slow ya disconnect ho gaya</strong>' +
+             'WiFi check karo, phone hotspot try karo, ya thodi der ruk ke "Retry" dabao. ' +
+             'Aapka data safe hai — cloud mein.';
+    }
+    if (/permission|JWT|denied/i.test(rawMsg)) {
+      return '<strong>Database access mein issue hai</strong>' +
+             'Ye technical problem hai. Page reload karo (F5).';
+    }
+    if (/table|relation/i.test(rawMsg)) {
+      return '<strong>Database table missing</strong>' +
+             'Supabase mein "shops" table create nahi hui.';
+    }
+    return '<strong>Cloud se connect nahi ho paya</strong>' +
+           'Internet check karo aur "Retry" dabao. Data abhi bhi safe hai cloud mein.';
+  }
+
+  // ================================================================
+  // 4. WRAP loadData WITH RETRY
+  // ================================================================
+  let originalLoadData = null;
+  function wrapLoadData() {
+    if (typeof window.loadData !== 'function') return false;
+    if (originalLoadData) return true;
+    originalLoadData = window.loadData;
+
+    window.loadData = async function patchedLoadData() {
+      const MAX_RETRIES = 3;
+      const delays = [0, 2000, 5000];
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (attempt > 1) {
+            if (typeof window.showLoadingOverlay === 'function') {
+              window.showLoadingOverlay('Connection retry ' + attempt + '/' + MAX_RETRIES + '...');
+            }
+            await new Promise(r => setTimeout(r, delays[attempt - 1]));
+          }
+
+          const alertBefore = window.alert;
+          window.alert = function() {};
+          let attemptError = null;
+          try {
+            await originalLoadData.call(this);
+          } catch (e) {
+            attemptError = e;
+          } finally {
+            window.alert = alertBefore;
+          }
+
+          let succeeded = false;
+          try { succeeded = (typeof isOnline !== 'undefined' && isOnline === true); } catch (e) {}
+
+          if (succeeded) {
+            console.log('[connection-fixes] loadData succeeded on attempt ' + attempt);
+            updateConnectionStatus(true);
+            hideConnectionBanner();
+            return;
+          }
+          lastError = attemptError || new Error('Load returned but isOnline=false');
+        } catch (err) {
+          lastError = err;
+          console.warn('[connection-fixes] loadData attempt ' + attempt + ' failed:', err);
+        }
+      }
+
+      if (typeof window.hideLoadingOverlay === 'function') window.hideLoadingOverlay();
+      updateConnectionStatus(false);
+      const friendly = buildFriendlyMessage((lastError && lastError.message) || 'Unknown error');
+      showConnectionBanner(friendly, 'error', true);
+    };
+    return true;
+  }
+
+  // ================================================================
+  // 5. WRAP refreshFromCloud WITH RETRY
+  // ================================================================
+  let originalRefreshFromCloud = null;
+  function wrapRefreshFromCloud() {
+    if (typeof window.refreshFromCloud !== 'function') return false;
+    if (originalRefreshFromCloud) return true;
+    originalRefreshFromCloud = window.refreshFromCloud;
+
+    window.refreshFromCloud = async function patchedRefresh() {
+      const MAX_RETRIES = 3;
+      const delays = [0, 1500, 4000];
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (attempt > 1) {
+            if (typeof window.showLoadingOverlay === 'function') {
+              window.showLoadingOverlay('Refresh retry ' + attempt + '/' + MAX_RETRIES + '...');
+            }
+            await new Promise(r => setTimeout(r, delays[attempt - 1]));
+          }
+
+          const alertBefore = window.alert;
+          window.alert = function() {};
+          try {
+            await originalRefreshFromCloud.call(this);
+          } finally {
+            window.alert = alertBefore;
+          }
+
+          let ok = false;
+          try { ok = (typeof isOnline !== 'undefined' && isOnline === true); } catch (e) {}
+          if (ok) {
+            updateConnectionStatus(true);
+            hideConnectionBanner();
+            return;
+          }
+        } catch (err) {
+          lastError = err;
+          console.warn('[connection-fixes] refresh attempt ' + attempt + ' failed:', err);
+        }
+      }
+
+      updateConnectionStatus(false);
+      if (typeof window.hideLoadingOverlay === 'function') window.hideLoadingOverlay();
+      showConnectionBanner(
+        buildFriendlyMessage((lastError && lastError.message) || 'Refresh failed'),
+        'error', true
+      );
+    };
+    return true;
+  }
+
+  // ================================================================
+  // 6. AUTO-RECONNECT on browser online/offline events
+  // ================================================================
+  window.addEventListener('online', async () => {
+    console.log('[connection-fixes] Browser back online');
+    let userLoggedIn = false;
+    try { userLoggedIn = (typeof currentUser !== 'undefined' && !!currentUser); } catch (e) {}
+    if (userLoggedIn) {
+      showConnectionBanner(
+        '<strong>Internet wapas aa gaya</strong>Cloud se latest data laa rahe hain...',
+        'info', false
+      );
+      setTimeout(() => {
+        if (typeof window.refreshFromCloud === 'function') {
+          window.refreshFromCloud();
+        }
+      }, 500);
+    }
+  });
+
+  window.addEventListener('offline', () => {
+    console.log('[connection-fixes] Browser went offline');
+    try { if (typeof isOnline !== 'undefined') isOnline = false; } catch (e) {}
+    updateConnectionStatus(false);
+    showConnectionBanner(
+      '<strong>Internet chala gaya</strong>Aap kaam kar sakte ho, lekin changes save nahi honge jab tak internet wapas na aaye.',
+      'warn', false
+    );
+  });
+
+  // ================================================================
+  // 7. HEALTH CHECK every 60 seconds
+  // ================================================================
+  setInterval(async () => {
+    let onlineFlag = false, dbRef = null, userLoggedIn = false;
+    try { onlineFlag = (typeof isOnline !== 'undefined' ? isOnline : false); } catch (e) {}
+    try { dbRef = (typeof db !== 'undefined' ? db : null); } catch (e) {}
+    try { userLoggedIn = (typeof currentUser !== 'undefined' && !!currentUser); } catch (e) {}
+
+    if (!userLoggedIn || !dbRef) return;
+
+    if (!onlineFlag && navigator.onLine) {
+      try {
+        const { error } = await dbRef.from('shops').select('shop_id').limit(1);
+        if (!error) {
+          console.log('[connection-fixes] Health check: connection restored');
+          updateConnectionStatus(true);
+          showConnectionBanner(
+            '<strong>Connection restore ho gaya</strong>"Refresh" button dabao latest data ke liye.',
+            'success', false
+          );
+          try { isOnline = true; } catch (e) {}
+        }
+      } catch (e) {
+        // still offline
+      }
+    }
+  }, 60000);
+
+  // ================================================================
+  // 8. WRAP FUNCTIONS — retry until main script defines them
+  // ================================================================
+  let wrapAttempts = 0;
+  const wrapInterval = setInterval(() => {
+    wrapAttempts++;
+    const loadDone = wrapLoadData();
+    const refreshDone = wrapRefreshFromCloud();
+    if (loadDone && refreshDone) {
+      clearInterval(wrapInterval);
+      console.log('[connection-fixes] ✓ All functions wrapped successfully');
+      try {
+        if (typeof isOnline !== 'undefined') updateConnectionStatus(isOnline);
+      } catch (e) {
+        updateConnectionStatus(navigator.onLine);
+      }
+    }
+    if (wrapAttempts > 50) {
+      clearInterval(wrapInterval);
+      console.warn('[connection-fixes] Some functions not wrapped after 5s');
+    }
+  }, 100);
+
+  // ================================================================
+  // 9. EXPOSE INTERNAL API
+  // ================================================================
+  window.__connFix = {
+    showBanner: showConnectionBanner,
+    hideConnectionBanner: hideConnectionBanner,
+    updateStatus: updateConnectionStatus,
+    retryConnection: async function() {
+      hideConnectionBanner();
+      let userLoggedIn = false;
+      try { userLoggedIn = (typeof currentUser !== 'undefined' && !!currentUser); } catch (e) {}
+      if (userLoggedIn && typeof window.refreshFromCloud === 'function') {
+        showConnectionBanner('<strong>Connect ho rahe hain...</strong>', 'info', false);
+        await window.refreshFromCloud();
+      } else if (typeof window.setupAuthListener === 'function') {
+        showConnectionBanner('<strong>Connect ho rahe hain...</strong>', 'info', false);
+        await window.setupAuthListener();
+      } else {
+        location.reload();
+      }
+    }
+  };
+
+  console.log('🔧 Connection-fixes patch loaded successfully');
+})();
+</script>
+<!-- END PATCH -->
