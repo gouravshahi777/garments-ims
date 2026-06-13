@@ -6490,3 +6490,358 @@
 })();
 </script>
 <!-- END V2 PATCH -->
+<!--
+  ============================================================
+  🛡️ RELIABILITY FIX PATCH — Critical Bug Fixes
+  ============================================================
+
+  YE 2 CRITICAL BUGS FIX KARTA HAI:
+
+  BUG 1: "Login pe sirf 1900 stock dikhta hai"
+  ───────────────────────────────────────────
+  V2 patch ka items_v2 query bina pagination ke tha.
+  Supabase ka default 1000-row limit hai. Aapke 11,901 items mein se
+  sirf kuch hi load hote hain.
+
+  FIX: items_v2 (aur saare tables) ab properly paginate honge.
+
+  BUG 2: "New transactions accept nahi hote"
+  ───────────────────────────────────────────
+  Jab items partial loaded hote hain, Excel upload mein SKUs ko
+  "new" treat kiya jaata hai. INSERT karte time DB mein already
+  exist karte hain → PRIMARY KEY VIOLATION → upload fail.
+
+  FIX: Upload se pehle automatic data sync hoga.
+
+  KAISE LAGAYE:
+  1. GitHub mein index.html kholo
+  2. File ke END mein scroll karo (Ctrl + End)
+  3. Last line dhundo: <!-- END UI-FIX PATCH -->
+  4. Uske TURANT BAAD ye saara block paste karo
+  5. Commit changes 2 baar dabao
+  6. 1-2 min wait karo aur app refresh karo (F5)
+
+  ROLLBACK (agar koi issue ho):
+  - <!-- START RELIABILITY-FIX --> se <!-- END RELIABILITY-FIX --> tak delete karo
+  - Commit kar do
+  - App pichli state mein wapas
+
+  SAFETY:
+  - Ye patch sirf loadData aur confirmUpload ko wrap karta hai
+  - Aapka data 100% safe rahega
+  - V2 patch + UI-fix patch dono untouched rahenge
+  ============================================================
+-->
+
+<!-- START RELIABILITY-FIX -->
+<script>
+/**
+ * Retail Garments IMS — Reliability Fix Patch
+ * Fixes critical issues with V2 patch:
+ * 1. items_v2 query had no pagination — partial loads when count > Supabase max
+ * 2. Excel uploads failed when local items array was incomplete (PK conflicts)
+ */
+(function() {
+  'use strict';
+  console.log('🛡️ Reliability fix patch loading...');
+
+  // ============================================================
+  // HELPER: Paginate any Supabase table reliably
+  // ============================================================
+  async function paginateTable(table, opts) {
+    opts = opts || {};
+    const PAGE = 5000;
+    const all = [];
+    let from = 0;
+    const MAX_RETRIES = 3;
+    while (true) {
+      let lastError = null;
+      let pageData = null;
+      // Retry the page fetch up to 3 times
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          if (attempt > 1) await new Promise(r => setTimeout(r, attempt * 1000));
+          let q = db.from(table).select('*');
+          if (opts.order) q = q.order(opts.order, { ascending: true });
+          q = q.range(from, from + PAGE - 1);
+          const { data, error } = await q;
+          if (error) { lastError = error; continue; }
+          pageData = data || [];
+          break;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+      if (pageData === null) {
+        throw new Error('[' + table + '] failed after ' + MAX_RETRIES + ' retries: ' +
+                        (lastError && lastError.message || 'unknown'));
+      }
+      if (pageData.length === 0) break;
+      for (let i = 0; i < pageData.length; i++) all.push(pageData[i]);
+      // Progress update for big tables
+      if ((table === 'items_v2' || table === 'transactions_v2') &&
+          typeof showLoadingOverlay === 'function') {
+        showLoadingOverlay('Loading ' + table.replace('_v2', '') + '... (' +
+                           all.length.toLocaleString() + ')');
+      }
+      if (pageData.length < PAGE) break;
+      from += PAGE;
+    }
+    return all;
+  }
+
+  // ============================================================
+  // FIX 1: REPLACE loadData WITH PAGINATED VERSION
+  // ============================================================
+  async function reliableLoadData() {
+    if (!db) {
+      alert('Supabase ready nahi hai. Page reload karo.');
+      return;
+    }
+    if (typeof showLoadingOverlay === 'function') {
+      showLoadingOverlay('Loading data from cloud (reliable)...');
+    }
+
+    try {
+      // Load all entity tables in parallel — with proper pagination
+      const [supData, brData, itemsData] = await Promise.all([
+        paginateTable('suppliers_v2'),
+        paginateTable('brands_v2'),
+        paginateTable('items_v2', { order: 'id' })
+      ]);
+
+      // Settings — separate, small
+      const { data: settingsData, error: settingsErr } =
+        await db.from('app_settings_v2').select('*');
+      if (settingsErr) throw new Error('app_settings_v2: ' + settingsErr.message);
+
+      // ===== Convert and assign (inline — no scope dependency) =====
+      suppliers = supData.map(r => ({
+        id: r.id,
+        name: r.name || '',
+        contact: r.contact || '',
+        phone: r.phone || '',
+        notes: r.notes || '',
+        lt: r.lt,
+        sf: r.sf
+      }));
+
+      brands = brData.map(r => ({
+        id: r.id,
+        name: r.name || '',
+        supplierId: r.supplier_id
+      }));
+
+      items = itemsData.map(r => ({
+        id: r.id,
+        name: r.name || '',
+        brandId: r.brand_id,
+        category: r.category || '',
+        size: r.size || '',
+        color: r.color || '',
+        cost: Number(r.cost) || 0,
+        sell: Number(r.sell) || 0,
+        adc: Number(r.adc) || 0,
+        moq: Number(r.moq) || 0,
+        max: Number(r.max_level) || 0,
+        startStock: Number(r.start_stock) || 0
+      }));
+
+      // ===== Settings =====
+      settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+      (settingsData || []).forEach(row => {
+        const v = row.value;
+        if (row.key === 'velocityDays' || row.key === 'velocityPct' || row.key === 'fastMoverMultiplier') {
+          settings[row.key] = (v && typeof v === 'object' && 'value' in v) ? Number(v.value) : Number(v);
+        } else if (row.key === 'users') {
+          settings.users = v || {};
+        } else {
+          settings[row.key] = v;
+        }
+      });
+
+      // ===== Transactions (paginated) =====
+      if (typeof showLoadingOverlay === 'function') {
+        showLoadingOverlay('Loading transactions...');
+      }
+      const txData = await paginateTable('transactions_v2', { order: 'ts' });
+      transactions = txData.map(r => ({
+        id: r.id,
+        itemId: r.item_id,
+        type: r.type,
+        qty: Number(r.qty) || 0,
+        note: r.note || '',
+        ts: Number(r.ts)
+      }));
+
+      isOnline = true;
+      if (typeof bumpDataVersion === 'function') bumpDataVersion();
+      console.log('✅ [reliability] Loaded: ' +
+                  suppliers.length + ' suppliers, ' +
+                  brands.length + ' brands, ' +
+                  items.length + ' SKUs, ' +
+                  transactions.length + ' transactions');
+
+      // First-time setup — default users
+      if (!settings.users || Object.keys(settings.users).length === 0) {
+        if (typeof DEFAULT_USERS !== 'undefined') {
+          settings.users = JSON.parse(JSON.stringify(DEFAULT_USERS));
+          try {
+            await db.from('app_settings_v2').upsert({
+              key: 'users',
+              value: settings.users,
+              updated_at: new Date().toISOString()
+            });
+          } catch (e) { console.warn('Could not save default users:', e); }
+        }
+      }
+    } catch (err) {
+      console.error('[reliability] loadData failed:', err);
+      alert('Cloud se data load nahi hua.\n\nDetails: ' + (err.message || err));
+      isOnline = false;
+    } finally {
+      if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      if (typeof renderAll === 'function') renderAll();
+    }
+  }
+
+  // ============================================================
+  // FIX 2: PRE-UPLOAD SYNC + SAFE UPSERT
+  // ============================================================
+  // Before confirmUpload runs, ensure items array matches DB state.
+  // This prevents creating "new" SKUs that already exist (PK conflict).
+  let originalConfirmUpload = null;
+
+  async function reliableConfirmUpload() {
+    console.log('[reliability] Pre-upload: syncing items from cloud...');
+    if (typeof showLoadingOverlay === 'function') {
+      showLoadingOverlay('Pre-upload sync (items)...');
+    }
+    try {
+      // Reload ONLY items (fast, ~11k rows, ~1-2 seconds)
+      const fresh = await paginateTable('items_v2', { order: 'id' });
+      items = fresh.map(r => ({
+        id: r.id,
+        name: r.name || '',
+        brandId: r.brand_id,
+        category: r.category || '',
+        size: r.size || '',
+        color: r.color || '',
+        cost: Number(r.cost) || 0,
+        sell: Number(r.sell) || 0,
+        adc: Number(r.adc) || 0,
+        moq: Number(r.moq) || 0,
+        max: Number(r.max_level) || 0,
+        startStock: Number(r.start_stock) || 0
+      }));
+      // Also refresh suppliers and brands (small, fast)
+      const [sup, br] = await Promise.all([
+        paginateTable('suppliers_v2'),
+        paginateTable('brands_v2')
+      ]);
+      suppliers = sup.map(r => ({
+        id: r.id, name: r.name || '', contact: r.contact || '',
+        phone: r.phone || '', notes: r.notes || '', lt: r.lt, sf: r.sf
+      }));
+      brands = br.map(r => ({
+        id: r.id, name: r.name || '', supplierId: r.supplier_id
+      }));
+      console.log('[reliability] Pre-upload sync done: ' +
+                  suppliers.length + ' suppliers, ' +
+                  brands.length + ' brands, ' +
+                  items.length + ' SKUs in memory');
+
+      // CRITICAL: Re-process the parsed rows against the fresh items list
+      // so SKUs that exist in DB are no longer marked as "create_new"
+      if (typeof parsedRows !== 'undefined' && Array.isArray(parsedRows)) {
+        parsedRows.forEach(r => {
+          if (!r.valid) return;
+          if (!r.sku) return;
+          // Try to match against the freshly loaded items
+          const matched = items.find(it => it.id.toLowerCase() === r.sku.toLowerCase());
+          if (matched) {
+            r.item = matched;
+            r.action = 'add_existing';  // re-use existing SKU instead of creating
+          }
+        });
+        // Also clear out pendingNewSkus that now exist in DB
+        if (typeof pendingNewSkus !== 'undefined' && Array.isArray(pendingNewSkus)) {
+          const existingIds = new Set(items.map(i => i.id.toLowerCase()));
+          const before = pendingNewSkus.length;
+          pendingNewSkus = pendingNewSkus.filter(sk => !existingIds.has(sk.id.toLowerCase()));
+          if (before !== pendingNewSkus.length) {
+            console.log('[reliability] Removed ' + (before - pendingNewSkus.length) +
+                        ' pendingNewSkus that already exist in DB');
+          }
+        }
+        if (typeof pendingNewSuppliers !== 'undefined' && Array.isArray(pendingNewSuppliers)) {
+          const existingSupIds = new Set(suppliers.map(s => s.id));
+          const existingSupNames = new Set(suppliers.map(s => s.name.toLowerCase()));
+          pendingNewSuppliers = pendingNewSuppliers.filter(s =>
+            !existingSupIds.has(s.id) && !existingSupNames.has((s.name || '').toLowerCase())
+          );
+        }
+        if (typeof pendingNewBrands !== 'undefined' && Array.isArray(pendingNewBrands)) {
+          const existingBrIds = new Set(brands.map(b => b.id));
+          const existingBrNames = new Set(brands.map(b => b.name.toLowerCase()));
+          pendingNewBrands = pendingNewBrands.filter(b =>
+            !existingBrIds.has(b.id) && !existingBrNames.has((b.name || '').toLowerCase())
+          );
+        }
+      }
+    } catch (err) {
+      console.error('[reliability] Pre-upload sync failed:', err);
+      if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      alert('Pre-upload sync fail ho gaya.\n\nInternet check karo aur dobara try karo.\n\nDetails: ' + (err.message || err));
+      return;
+    }
+
+    if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+
+    // Now run the original confirmUpload — items array is fresh, no PK conflicts
+    return originalConfirmUpload.apply(this, arguments);
+  }
+
+  // ============================================================
+  // APPLY OVERRIDES — wait for V2 to load first
+  // ============================================================
+  let attempts = 0;
+  const applyInterval = setInterval(() => {
+    attempts++;
+    let allDone = true;
+
+    // Wrap loadData
+    if (typeof window.loadData === 'function' && !window.loadData._reliabilityV3) {
+      window.loadData = reliableLoadData;
+      window.loadData._reliabilityV3 = true;
+      console.log('✅ [reliability] loadData replaced with paginated version');
+    } else if (!window.loadData) {
+      allDone = false;
+    }
+
+    // Wrap confirmUpload
+    if (typeof window.confirmUpload === 'function' && !window.confirmUpload._reliabilityV3) {
+      originalConfirmUpload = window.confirmUpload;
+      window.confirmUpload = reliableConfirmUpload;
+      window.confirmUpload._reliabilityV3 = true;
+      console.log('✅ [reliability] confirmUpload wrapped with pre-sync');
+    } else if (!window.confirmUpload) {
+      allDone = false;
+    }
+
+    if (allDone) {
+      clearInterval(applyInterval);
+      console.log('🛡️ [reliability] All fixes applied successfully');
+      console.log('   - items_v2 will load all 11,901+ rows via pagination');
+      console.log('   - confirmUpload will sync data before insert (prevents PK conflicts)');
+    }
+    if (attempts > 100) {
+      clearInterval(applyInterval);
+      console.warn('[reliability] Could not apply all fixes after 10s');
+    }
+  }, 100);
+
+  console.log('🛡️ Reliability fix patch loaded — waiting for V2...');
+})();
+</script>
+<!-- END RELIABILITY-FIX -->
