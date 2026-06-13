@@ -5159,3 +5159,1334 @@
 })();
 </script>
 <!-- END PATCH -->
+<!--
+  ============================================================
+  📦 V2 STORAGE PATCH — Use _v2 Tables Instead of shops Table
+  ============================================================
+
+  PURPOSE:
+  Aapki app ko `shops` table (jo ek hi row mein 16 MB tak data rakhti hai)
+  se shift karke `_v2` tables (suppliers_v2, brands_v2, items_v2,
+  transactions_v2, app_settings_v2) pe le jaata hai.
+
+  ISKA FAAYDA:
+  - Pehle: har save mein 16 MB data internet pe travel karta tha (slow, fail prone)
+  - Ab: sirf 1-2 KB ka data har save mein (1000× faster)
+  - Pehle: 500 MB capacity wasted (Supabase limit), 16 MB hard cliff
+  - Ab: 500 MB tak FULL use kar sakte ho (lakhs of transactions safely)
+
+  KAISE LAGAYE:
+  1. GitHub mein index.html kholo (web editor)
+  2. File ke ENDE mein scroll karo
+  3. <!-- END PATCH --> wali line dhundo (ye connection-fixes ka end hai)
+  4. Uske TURANT BAAD ye saara block paste karo (start-to-end)
+  5. Commit changes 2 baar dabao
+  6. 1-2 min wait karo aur app refresh karo (F5)
+
+  YE PATCH KYA KARTA HAI:
+  - loadData → 5 _v2 tables se data load karta hai (paginated transactions)
+  - Har CRUD operation → direct _v2 table mein save (no more 16 MB blob)
+  - Excel uploads → batched inserts (500 transactions at a time)
+  - Wipe/Restore → proper TRUNCATE + insert
+  - Settings (users, velocity) → app_settings_v2 table mein
+
+  SAFETY:
+  - Aapka `shops` table ABHI BHI EXIST kar sakta hai backup ke liye
+  - Migration ho chuki hai (75,756 transactions _v2 mein hain)
+  - Agar kuch galat ho: ye patch hata do, app shops table use karna shuru kar degi
+    (lekin tab data sync nahi hoga — restore karna padega backup se)
+
+  ============================================================
+-->
+
+<!-- START V2 PATCH -->
+<script>
+/**
+ * Retail Garments IMS — V2 Storage Patch
+ * Converts storage from `shops` (single row JSONB) to relational `_v2` tables.
+ *
+ * Design: This patch waits for the original script to define its functions,
+ * then OVERRIDES them with V2-aware versions. The in-memory arrays
+ * (suppliers, brands, items, transactions, settings) remain the source of
+ * truth for all rendering/calculation logic — we only change HOW they're
+ * loaded from and saved to the cloud.
+ */
+(function() {
+  'use strict';
+  console.log('📦 V2 storage patch loading...');
+
+  // ============================================================
+  // CONFIG — same Supabase project, but new tables
+  // ============================================================
+  const SHOP_DOC = 'mainshop'; // unused in v2 but kept for compat
+
+  // ============================================================
+  // SCHEMA CONVERTERS — app object <-> database row
+  // ============================================================
+  // App's internal format uses camelCase (brandId, startStock, etc.)
+  // Database tables use snake_case (brand_id, start_stock, etc.)
+
+  function toRowSupplier(s) {
+    return {
+      id: s.id,
+      name: s.name || '',
+      contact: s.contact || '',
+      phone: s.phone || '',
+      notes: s.notes || '',
+      lt: (s.lt == null || s.lt === '') ? null : Number(s.lt),
+      sf: (s.sf == null || s.sf === '') ? null : Number(s.sf)
+    };
+  }
+  function rowToSupplier(r) {
+    return {
+      id: r.id,
+      name: r.name || '',
+      contact: r.contact || '',
+      phone: r.phone || '',
+      notes: r.notes || '',
+      lt: r.lt,
+      sf: r.sf
+    };
+  }
+
+  function toRowBrand(b) {
+    return {
+      id: b.id,
+      name: b.name || '',
+      supplier_id: b.supplierId || null
+    };
+  }
+  function rowToBrand(r) {
+    return {
+      id: r.id,
+      name: r.name || '',
+      supplierId: r.supplier_id
+    };
+  }
+
+  function toRowItem(i) {
+    return {
+      id: i.id,
+      name: i.name || '',
+      brand_id: i.brandId || null,
+      category: i.category || '',
+      size: i.size || '',
+      color: i.color || '',
+      cost: Number(i.cost) || 0,
+      sell: Number(i.sell) || 0,
+      adc: Number(i.adc) || 0,
+      moq: Number(i.moq) || 0,
+      max_level: Number(i.max) || 0,
+      start_stock: Number(i.startStock) || 0
+    };
+  }
+  function rowToItem(r) {
+    return {
+      id: r.id,
+      name: r.name || '',
+      brandId: r.brand_id,
+      category: r.category || '',
+      size: r.size || '',
+      color: r.color || '',
+      cost: Number(r.cost) || 0,
+      sell: Number(r.sell) || 0,
+      adc: Number(r.adc) || 0,
+      moq: Number(r.moq) || 0,
+      max: Number(r.max_level) || 0,
+      startStock: Number(r.start_stock) || 0
+    };
+  }
+
+  function toRowTransaction(t) {
+    const note = t.note || '';
+    const isReturn = !!(note.includes('[RETURN]') || note === 'RETURN' || note.endsWith(' RETURN'));
+    return {
+      id: t.id,
+      item_id: t.itemId || null,
+      type: t.type,
+      qty: Number(t.qty) || 0,
+      note: note,
+      ts: Number(t.ts) || Date.now(),
+      is_return: isReturn
+    };
+  }
+  function rowToTransaction(r) {
+    return {
+      id: r.id,
+      itemId: r.item_id,
+      type: r.type,
+      qty: Number(r.qty) || 0,
+      note: r.note || '',
+      ts: Number(r.ts)
+    };
+  }
+
+  // ============================================================
+  // CLOUD OPERATIONS — with retry logic
+  // ============================================================
+  // Every cloud op gets up to 3 attempts with backoff.
+  // This handles transient network issues without bothering the user.
+
+  async function cloudExec(fn, opName) {
+    const MAX = 3;
+    const delays = [0, 1000, 3000];
+    let lastError = null;
+    for (let i = 0; i < MAX; i++) {
+      try {
+        if (i > 0) await new Promise(r => setTimeout(r, delays[i]));
+        return await fn();
+      } catch (err) {
+        lastError = err;
+        console.warn('[v2-' + opName + '] attempt ' + (i + 1) + ' failed:', err && err.message);
+      }
+    }
+    throw lastError || new Error('cloudExec failed: ' + opName);
+  }
+
+  async function cloudUpsertSupplier(s) {
+    return cloudExec(async () => {
+      const { error } = await db.from('suppliers_v2').upsert(toRowSupplier(s));
+      if (error) throw error;
+    }, 'upsertSupplier');
+  }
+
+  async function cloudUpsertBrand(b) {
+    return cloudExec(async () => {
+      const { error } = await db.from('brands_v2').upsert(toRowBrand(b));
+      if (error) throw error;
+    }, 'upsertBrand');
+  }
+
+  async function cloudUpsertItem(i) {
+    return cloudExec(async () => {
+      const { error } = await db.from('items_v2').upsert(toRowItem(i));
+      if (error) throw error;
+    }, 'upsertItem');
+  }
+
+  async function cloudUpsertTransaction(t) {
+    return cloudExec(async () => {
+      const { error } = await db.from('transactions_v2').upsert(toRowTransaction(t));
+      if (error) throw error;
+    }, 'upsertTransaction');
+  }
+
+  // Batched insert — used by Excel uploads and restore
+  async function cloudInsertTransactionsBatch(txList, onProgress) {
+    if (!txList || txList.length === 0) return 0;
+    const BATCH = 500;
+    let inserted = 0;
+    for (let i = 0; i < txList.length; i += BATCH) {
+      const batch = txList.slice(i, i + BATCH).map(toRowTransaction);
+      await cloudExec(async () => {
+        const { error } = await db.from('transactions_v2').insert(batch);
+        if (error) throw error;
+      }, 'insertTx-batch-' + i);
+      inserted += batch.length;
+      if (onProgress) onProgress(inserted, txList.length);
+      await new Promise(r => setTimeout(r, 50));
+    }
+    return inserted;
+  }
+
+  // Batched insert for suppliers/brands/items (smaller batches OK)
+  async function cloudInsertEntitiesBatch(table, rows) {
+    if (!rows || rows.length === 0) return 0;
+    const BATCH = 100;
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const batch = rows.slice(i, i + BATCH);
+      await cloudExec(async () => {
+        const { error } = await db.from(table).insert(batch);
+        if (error) throw error;
+      }, 'insert-' + table + '-' + i);
+      inserted += batch.length;
+    }
+    return inserted;
+  }
+
+  async function cloudDeleteSupplier(id) {
+    return cloudExec(async () => {
+      const { error } = await db.from('suppliers_v2').delete().eq('id', id);
+      if (error) throw error;
+    }, 'deleteSupplier');
+  }
+
+  async function cloudDeleteBrand(id) {
+    return cloudExec(async () => {
+      const { error } = await db.from('brands_v2').delete().eq('id', id);
+      if (error) throw error;
+    }, 'deleteBrand');
+  }
+
+  async function cloudDeleteItem(id) {
+    return cloudExec(async () => {
+      const { error } = await db.from('items_v2').delete().eq('id', id);
+      if (error) throw error;
+    }, 'deleteItem');
+  }
+
+  async function cloudDeleteTransaction(id) {
+    return cloudExec(async () => {
+      const { error } = await db.from('transactions_v2').delete().eq('id', id);
+      if (error) throw error;
+    }, 'deleteTransaction');
+  }
+
+  async function cloudSaveSetting(key, value) {
+    return cloudExec(async () => {
+      // app_settings_v2.value is JSONB — wrap primitives so we can store consistently
+      const payload = (typeof value === 'object' && value !== null) ? value : { value: value };
+      const { error } = await db.from('app_settings_v2').upsert({
+        key: key,
+        value: payload,
+        updated_at: new Date().toISOString()
+      });
+      if (error) throw error;
+    }, 'saveSetting-' + key);
+  }
+
+  // Wipe all _v2 tables (used by wipeData and resetAndGuide)
+  async function cloudWipeAll() {
+    // Delete in FK-respecting order: transactions first, then items, brands, suppliers, settings
+    const tables = [
+      { name: 'transactions_v2', idCol: 'id' },
+      { name: 'items_v2', idCol: 'id' },
+      { name: 'brands_v2', idCol: 'id' },
+      { name: 'suppliers_v2', idCol: 'id' }
+    ];
+    for (const t of tables) {
+      await cloudExec(async () => {
+        const { error } = await db.from(t.name).delete().neq(t.idCol, '___never_matches___');
+        if (error) throw error;
+      }, 'wipe-' + t.name);
+    }
+    // Settings: keep users + velocity keys but wipe other data keys if any
+    // Actually wipe nothing in settings — those are config, not user data
+    // (If you want full reset including users, that's handled in caller)
+  }
+
+  // Wipe everything including settings
+  async function cloudWipeAllIncludingSettings() {
+    await cloudWipeAll();
+    await cloudExec(async () => {
+      const { error } = await db.from('app_settings_v2').delete().neq('key', '___never_matches___');
+      if (error) throw error;
+    }, 'wipe-app_settings_v2');
+  }
+
+  // ============================================================
+  // FUNCTION OVERRIDES
+  // ============================================================
+  // Wait for original functions to be defined, then replace them.
+  // We monkey-patch instead of editing the original script directly,
+  // so the rollback is trivial: just delete this <script> block.
+
+  let patchAttempts = 0;
+  const patchInterval = setInterval(() => {
+    patchAttempts++;
+    if (typeof window.loadData !== 'function' || typeof window.saveAll !== 'function') {
+      if (patchAttempts > 100) {
+        clearInterval(patchInterval);
+        console.error('[v2-storage] Original functions not found after 10s. Patch aborted.');
+      }
+      return;
+    }
+
+    clearInterval(patchInterval);
+    applyOverrides();
+  }, 100);
+
+  function applyOverrides() {
+    console.log('[v2-storage] Original functions detected. Applying overrides...');
+
+    // ============================================================
+    // OVERRIDE: loadData
+    // ============================================================
+    // Read from all 5 _v2 tables. For transactions, paginate (75k+ rows).
+    // ============================================================
+    window.loadData = async function v2LoadData() {
+      if (!db) {
+        alert('Supabase ready nahi hai. Page reload karo.');
+        return;
+      }
+      if (typeof showLoadingOverlay === 'function') {
+        showLoadingOverlay('Loading data from cloud (v2)...');
+      }
+      try {
+        // ============== PARALLEL LOAD: small tables ==============
+        const [supRes, brRes, itemsRes, settingsRes] = await Promise.all([
+          db.from('suppliers_v2').select('*'),
+          db.from('brands_v2').select('*'),
+          db.from('items_v2').select('*'),
+          db.from('app_settings_v2').select('*')
+        ]);
+
+        if (supRes.error) throw new Error('suppliers_v2: ' + supRes.error.message);
+        if (brRes.error) throw new Error('brands_v2: ' + brRes.error.message);
+        if (itemsRes.error) throw new Error('items_v2: ' + itemsRes.error.message);
+        if (settingsRes.error) throw new Error('app_settings_v2: ' + settingsRes.error.message);
+
+        suppliers = (supRes.data || []).map(rowToSupplier);
+        brands = (brRes.data || []).map(rowToBrand);
+        items = (itemsRes.data || []).map(rowToItem);
+
+        // ============== SETTINGS ==============
+        // Start with sensible defaults, then overlay what's stored.
+        settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+        (settingsRes.data || []).forEach(row => {
+          const v = row.value;
+          if (row.key === 'velocityDays' || row.key === 'velocityPct' || row.key === 'fastMoverMultiplier') {
+            // Stored as { value: N }
+            settings[row.key] = (v && typeof v === 'object' && 'value' in v) ? Number(v.value) : Number(v);
+          } else if (row.key === 'users') {
+            // Stored as the users object directly
+            settings.users = v || {};
+          } else {
+            settings[row.key] = v;
+          }
+        });
+
+        // ============== TRANSACTIONS — PAGED LOAD ==============
+        // 75k+ rows — load in 5000-row pages
+        if (typeof showLoadingOverlay === 'function') {
+          showLoadingOverlay('Loading transactions...');
+        }
+        transactions = [];
+        let from = 0;
+        const PAGE = 5000;
+        while (true) {
+          const { data: page, error: txErr } = await db
+            .from('transactions_v2')
+            .select('*')
+            .order('ts', { ascending: true })
+            .range(from, from + PAGE - 1);
+          if (txErr) throw new Error('transactions_v2 page ' + from + ': ' + txErr.message);
+          if (!page || page.length === 0) break;
+          for (let i = 0; i < page.length; i++) {
+            transactions.push(rowToTransaction(page[i]));
+          }
+          if (page.length < PAGE) break;
+          from += PAGE;
+          // Show progress for big loads
+          if (typeof showLoadingOverlay === 'function') {
+            showLoadingOverlay('Loading transactions... (' + transactions.length.toLocaleString() + ')');
+          }
+        }
+
+        isOnline = true;
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        console.log('✓ V2 Loaded: ' + suppliers.length + ' suppliers, ' + brands.length +
+                    ' brands, ' + items.length + ' SKUs, ' + transactions.length + ' transactions');
+
+        // ============== FIRST-TIME SETUP ==============
+        // If users key doesn't exist in settings, populate with defaults
+        // and save back so login works.
+        if (!settings.users || Object.keys(settings.users).length === 0) {
+          if (typeof DEFAULT_USERS !== 'undefined') {
+            settings.users = JSON.parse(JSON.stringify(DEFAULT_USERS));
+            try { await cloudSaveSetting('users', settings.users); }
+            catch (e) { console.warn('Could not save default users:', e); }
+          }
+        }
+
+      } catch (err) {
+        console.error('[v2-storage] load failed:', err);
+        alert('Cloud se data load nahi hua.\n\nDetails: ' + (err.message || err));
+        isOnline = false;
+      } finally {
+        if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+        if (typeof renderAll === 'function') renderAll();
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: saveAll
+    // ============================================================
+    // Old saveAll wrote the entire 16MB blob to shops.data on every change.
+    // V2: each CRUD function below saves DIRECTLY to its specific _v2 table,
+    // so saveAll just needs to bump cache version and mark success.
+    // ============================================================
+    window.saveAll = async function v2SaveAll() {
+      if (typeof bumpDataVersion === 'function') bumpDataVersion();
+      lastSaveOk = true;
+      return Promise.resolve();
+    };
+
+    // ============================================================
+    // OVERRIDE: refreshFromCloud
+    // ============================================================
+    // Same as loadData but called from the "🔄 Refresh" button
+    // (which is hidden by connection-fixes V1 but still callable).
+    // ============================================================
+    window.refreshFromCloud = async function v2RefreshFromCloud() {
+      if (!db) { if (typeof toast === 'function') toast('Supabase ready nahi hai'); return; }
+      if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Refreshing...');
+      try {
+        await window.loadData();
+        // Re-check role since users might have changed
+        if (typeof currentUser !== 'undefined' && currentUser) {
+          const users = typeof getUsersTable === 'function' ? getUsersTable() : (settings.users || {});
+          const userInfo = users[currentUser];
+          if (!userInfo) {
+            try { sessionStorage.removeItem('rg_session_user'); } catch (e) {}
+            location.reload();
+            return;
+          }
+          currentUserRole = userInfo.role;
+        }
+        if (typeof applyRolePermissions === 'function') applyRolePermissions();
+        if (typeof toast === 'function') toast('✓ Latest data load ho gaya');
+      } catch (err) {
+        console.error('[v2-storage] refresh failed:', err);
+        if (typeof toast === 'function') toast('⚠️ Refresh fail — internet check karo');
+      } finally {
+        if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: saveItem
+    // ============================================================
+    window.saveItem = async function v2SaveItem() {
+      const data = {
+        brandId: document.getElementById('m-brand').value,
+        name: document.getElementById('m-name').value.trim(),
+        category: document.getElementById('m-category').value.trim(),
+        size: document.getElementById('m-size').value.trim(),
+        color: document.getElementById('m-color').value.trim(),
+        cost: parseFloat(document.getElementById('m-cost').value) || 0,
+        sell: parseFloat(document.getElementById('m-sell').value) || 0,
+        adc: parseFloat(document.getElementById('m-adc').value) || 0,
+        moq: parseFloat(document.getElementById('m-moq').value) || 0,
+        max: parseFloat(document.getElementById('m-max').value) || 0,
+        startStock: parseFloat(document.getElementById('m-stock').value) || 0
+      };
+      if (!data.name) { alert('Item name is required'); return; }
+      if (!data.brandId) { alert('Pick a brand'); return; }
+
+      let item;
+      if (editingId) {
+        const idx = items.findIndex(i => i.id === editingId);
+        if (idx < 0) { alert('Item not found'); return; }
+        items[idx] = Object.assign({}, items[idx], data);
+        delete items[idx].lt;
+        delete items[idx].sf;
+        item = items[idx];
+      } else {
+        const id = 'i' + Date.now().toString(36);
+        item = Object.assign({ id: id }, data);
+        items.push(item);
+      }
+
+      try {
+        await cloudUpsertItem(item);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof closeModal === 'function') closeModal('item-modal');
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast(editingId ? 'SKU updated' : 'SKU added');
+      } catch (err) {
+        // Rollback in-memory change
+        if (editingId) {
+          // We can't easily restore the prior value — just refresh from cloud
+          await window.loadData();
+        } else {
+          items = items.filter(i => i.id !== item.id);
+        }
+        console.error('[v2-storage] saveItem failed:', err);
+        alert('Save fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: saveSupplier
+    // ============================================================
+    window.saveSupplier = async function v2SaveSupplier() {
+      const ltVal = document.getElementById('s-lt').value;
+      const sfVal = document.getElementById('s-sf').value;
+      const data = {
+        name: document.getElementById('s-name').value.trim(),
+        contact: document.getElementById('s-contact').value.trim(),
+        phone: document.getElementById('s-phone').value.trim(),
+        notes: document.getElementById('s-notes').value.trim(),
+        lt: ltVal === '' ? null : parseFloat(ltVal),
+        sf: sfVal === '' ? null : parseFloat(sfVal)
+      };
+      if (!data.name) { alert('Supplier name is required'); return; }
+
+      let sup;
+      if (editingId) {
+        const idx = suppliers.findIndex(s => s.id === editingId);
+        if (idx < 0) { alert('Supplier not found'); return; }
+        suppliers[idx] = Object.assign({}, suppliers[idx], data);
+        sup = suppliers[idx];
+      } else {
+        const id = 's' + Date.now().toString(36);
+        sup = Object.assign({ id: id }, data);
+        suppliers.push(sup);
+      }
+
+      try {
+        await cloudUpsertSupplier(sup);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof closeModal === 'function') closeModal('supplier-modal');
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast(editingId ? 'Supplier updated' : 'Supplier added');
+      } catch (err) {
+        if (!editingId) suppliers = suppliers.filter(s => s.id !== sup.id);
+        else await window.loadData();
+        console.error('[v2-storage] saveSupplier failed:', err);
+        alert('Save fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: saveBrand
+    // ============================================================
+    window.saveBrand = async function v2SaveBrand() {
+      const data = {
+        name: document.getElementById('b-name').value.trim(),
+        supplierId: document.getElementById('b-supplier').value
+      };
+      if (!data.name) { alert('Brand name is required'); return; }
+      if (!data.supplierId) { alert('Pick a supplier'); return; }
+
+      let br;
+      if (editingId) {
+        const idx = brands.findIndex(b => b.id === editingId);
+        if (idx < 0) { alert('Brand not found'); return; }
+        brands[idx] = Object.assign({}, brands[idx], data);
+        br = brands[idx];
+      } else {
+        const id = 'b' + Date.now().toString(36);
+        br = Object.assign({ id: id }, data);
+        brands.push(br);
+      }
+
+      try {
+        await cloudUpsertBrand(br);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof closeModal === 'function') closeModal('brand-modal');
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast(editingId ? 'Brand updated' : 'Brand added');
+      } catch (err) {
+        if (!editingId) brands = brands.filter(b => b.id !== br.id);
+        else await window.loadData();
+        console.error('[v2-storage] saveBrand failed:', err);
+        alert('Save fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: deleteItem
+    // ============================================================
+    // Database FK has ON DELETE CASCADE — deleting items_v2 row will
+    // automatically remove its transactions_v2 rows.
+    // ============================================================
+    window.deleteItem = async function v2DeleteItem(id) {
+      const it = items.find(i => i.id === id);
+      if (!it || !confirm('Delete "' + it.name + '"? Iski saari transactions bhi delete ho jayengi.')) return;
+      try {
+        await cloudDeleteItem(id);
+        items = items.filter(i => i.id !== id);
+        transactions = transactions.filter(t => t.itemId !== id);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast('SKU deleted');
+      } catch (err) {
+        console.error('[v2-storage] deleteItem failed:', err);
+        alert('Delete fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: deleteBrand
+    // ============================================================
+    window.deleteBrand = async function v2DeleteBrand(id) {
+      const b = (typeof getBrand === 'function') ? getBrand(id) : brands.find(x => x.id === id);
+      if (!b) return;
+      const brandItems = items.filter(i => i.brandId === id);
+      if (!confirm('Delete brand "' + b.name + '"? Iske ' + brandItems.length + ' SKU(s) bhi delete honge.')) return;
+      try {
+        await cloudDeleteBrand(id);
+        const removedItemIds = brandItems.map(i => i.id);
+        brands = brands.filter(x => x.id !== id);
+        items = items.filter(i => i.brandId !== id);
+        transactions = transactions.filter(t => removedItemIds.indexOf(t.itemId) === -1);
+        currentBrandFocus = null;
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast('Brand deleted');
+      } catch (err) {
+        console.error('[v2-storage] deleteBrand failed:', err);
+        alert('Delete fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: deleteSupplier
+    // ============================================================
+    window.deleteSupplier = async function v2DeleteSupplier(id) {
+      const s = (typeof getSupplier === 'function') ? getSupplier(id) : suppliers.find(x => x.id === id);
+      if (!s) return;
+      const supBrands = brands.filter(b => b.supplierId === id);
+      const supItems = items.filter(i => {
+        const b = brands.find(x => x.id === i.brandId);
+        return b && b.supplierId === id;
+      });
+      if (!confirm('Delete supplier "' + s.name + '"? Iske ' + supBrands.length + ' brand(s) aur ' + supItems.length + ' SKU(s) bhi delete honge.')) return;
+      try {
+        await cloudDeleteSupplier(id);
+        const removedBrandIds = supBrands.map(b => b.id);
+        const removedItemIds = supItems.map(i => i.id);
+        suppliers = suppliers.filter(x => x.id !== id);
+        brands = brands.filter(b => b.supplierId !== id);
+        items = items.filter(i => removedBrandIds.indexOf(i.brandId) === -1);
+        transactions = transactions.filter(t => removedItemIds.indexOf(t.itemId) === -1);
+        currentSupplierFocus = null;
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast('Supplier deleted');
+      } catch (err) {
+        console.error('[v2-storage] deleteSupplier failed:', err);
+        alert('Delete fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: deleteTransaction
+    // ============================================================
+    window.deleteTransaction = async function v2DeleteTransaction(id) {
+      if (!confirm('Delete this transaction?')) return;
+      try {
+        await cloudDeleteTransaction(id);
+        transactions = transactions.filter(t => t.id !== id);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast('Transaction deleted');
+      } catch (err) {
+        console.error('[v2-storage] deleteTransaction failed:', err);
+        alert('Delete fail — internet check karo. Details: ' + (err.message || err));
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: confirmUpload  (THE BIG ONE — Excel uploads)
+    // ============================================================
+    // This handles 1000+ rows efficiently using batched inserts.
+    // It also creates any new suppliers/brands/SKUs first before
+    // inserting transactions, to satisfy foreign key constraints.
+    // ============================================================
+    window.confirmUpload = async function v2ConfirmUpload() {
+      let valid = parsedRows.filter(r => r.valid);
+      if (valid.length === 0) return;
+
+      // Apply skip-duplicates option (same logic as original)
+      const skipCheckbox = document.getElementById('skip-duplicates-checkbox');
+      const skipDuplicates = skipCheckbox ? skipCheckbox.checked : true;
+      const totalDuplicates = valid.filter(r => r.isDuplicate).length;
+      let skippedCount = 0;
+      if (skipDuplicates && totalDuplicates > 0) {
+        valid = valid.filter(r => !r.isDuplicate);
+        skippedCount = totalDuplicates;
+        if (valid.length === 0) {
+          alert('Saari rows duplicate hain — kuch import nahi hoga.');
+          return;
+        }
+      } else if (totalDuplicates > 0) {
+        const msg = '⚠️ FINAL WARNING\n\n' + totalDuplicates + ' duplicate rows force-import hongi.\n\nIska stock DOUBLE-COUNT ho jayega!\n\nSure?';
+        if (!confirm(msg)) return;
+      }
+
+      // Show loading overlay for big imports
+      const isBig = valid.length > 200;
+      if (isBig && typeof showLoadingOverlay === 'function') {
+        showLoadingOverlay('Saving ' + valid.length.toLocaleString() + ' rows...');
+      }
+
+      try {
+        // ============== STEP 1: Insert new suppliers ==============
+        if (pendingNewSuppliers.length > 0) {
+          const supRows = pendingNewSuppliers.map(s => toRowSupplier(Object.assign({
+            contact: '', phone: '', notes: '', lt: null, sf: null
+          }, s)));
+          await cloudInsertEntitiesBatch('suppliers_v2', supRows);
+          pendingNewSuppliers.forEach(s => {
+            if (!suppliers.find(x => x.id === s.id)) {
+              suppliers.push(Object.assign({ contact: '', phone: '', notes: '', lt: null, sf: null }, s));
+            }
+          });
+        }
+
+        // ============== STEP 2: Insert new brands ==============
+        if (pendingNewBrands.length > 0) {
+          const brRows = pendingNewBrands.map(toRowBrand);
+          await cloudInsertEntitiesBatch('brands_v2', brRows);
+          pendingNewBrands.forEach(b => {
+            if (!brands.find(x => x.id === b.id)) brands.push(Object.assign({}, b));
+          });
+        }
+
+        // ============== STEP 3: Calculate opening stock for sale-only SKUs ==============
+        // (Same logic as original — for SKUs created from sale data, set startStock
+        // = total sold so that final stock comes out to 0 instead of negative.)
+        const skuTotalSale = new Map();
+        if (uploadType === 'Out') {
+          valid.forEach(r => {
+            if (!r.sku) return;
+            const change = r.isReturn ? -r.qty : r.qty;
+            skuTotalSale.set(r.sku, (skuTotalSale.get(r.sku) || 0) + change);
+          });
+        }
+
+        // ============== STEP 4: Insert new SKUs ==============
+        if (pendingNewSkus.length > 0) {
+          // Apply opening stock adjustments
+          pendingNewSkus.forEach(sk => {
+            if (uploadType === 'Out') {
+              const totalSold = skuTotalSale.get(sk.id) || 0;
+              if (totalSold > 0) sk.startStock = totalSold;
+            }
+          });
+          const itemRows = pendingNewSkus.map(toRowItem);
+          await cloudInsertEntitiesBatch('items_v2', itemRows);
+          pendingNewSkus.forEach(sk => {
+            if (!items.find(x => x.id === sk.id)) items.push(Object.assign({}, sk));
+          });
+        }
+
+        // ============== STEP 5: Build transaction list ==============
+        const ts = Date.now();
+        const newTxs = valid.map((r, i) => {
+          let txTs = ts + i;
+          if (r.date && typeof parseDate === 'function') {
+            const parsed = parseDate(r.date);
+            if (parsed) txTs = parsed.getTime() + i;
+          }
+          const itemId = r.item ? r.item.id : r.sku;
+          const txType = r.isReturn ? (uploadType === 'Out' ? 'In' : 'Out') : uploadType;
+          const txNote = r.isReturn ? (r.note ? r.note + ' [RETURN]' : '[RETURN]') : r.note;
+          return {
+            id: 't' + (ts + i).toString(36) + Math.random().toString(36).slice(2, 5),
+            itemId: itemId,
+            type: txType,
+            qty: r.qty,
+            note: txNote,
+            ts: txTs
+          };
+        });
+
+        // ============== STEP 6: BATCH INSERT transactions ==============
+        await cloudInsertTransactionsBatch(newTxs, (done, total) => {
+          if (isBig && typeof showLoadingOverlay === 'function') {
+            showLoadingOverlay('Inserted ' + done.toLocaleString() + ' / ' + total.toLocaleString() + ' transactions...');
+          }
+        });
+
+        // Add to in-memory array
+        for (let i = 0; i < newTxs.length; i++) transactions.push(newTxs[i]);
+
+        // ============== STEP 7: AUTO-FIX NEGATIVE STOCK (sale uploads) ==============
+        let autoFixCount = 0;
+        let autoFixTotalPcs = 0;
+        if (uploadType === 'Out') {
+          if (typeof bumpDataVersion === 'function') bumpDataVersion();
+          if (typeof buildStockCache === 'function') buildStockCache();
+
+          const touchedSkus = new Set();
+          valid.forEach(r => {
+            const itemId = r.item ? r.item.id : r.sku;
+            if (itemId) touchedSkus.add(itemId);
+          });
+
+          const itemsToUpdate = [];
+          touchedSkus.forEach(skuId => {
+            const item = items.find(i => i.id === skuId);
+            if (!item) return;
+            const stock = (typeof getStock === 'function') ? getStock(skuId) : 0;
+            if (stock < 0) {
+              const deficit = Math.abs(stock);
+              item.startStock = (Number(item.startStock) || 0) + deficit;
+              itemsToUpdate.push(item);
+              autoFixCount++;
+              autoFixTotalPcs += deficit;
+            }
+          });
+
+          // Push updates to cloud
+          for (const it of itemsToUpdate) {
+            try { await cloudUpsertItem(it); }
+            catch (e) { console.warn('Failed to sync auto-fix for ' + it.id, e); }
+          }
+          if (autoFixCount > 0 && typeof bumpDataVersion === 'function') bumpDataVersion();
+        }
+
+        // Clear pending
+        pendingNewSuppliers = [];
+        pendingNewBrands = [];
+        pendingNewSkus = [];
+
+        if (isBig && typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+
+        if (typeof closeModal === 'function') closeModal('upload-modal');
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof switchTab === 'function') switchTab('livestock');
+
+        let msg = '✓ Imported ' + valid.length + ' ' + (uploadType === 'In' ? 'purchase' : 'sale') + ' row' + (valid.length === 1 ? '' : 's');
+        if (skippedCount > 0) msg += ' · Skipped ' + skippedCount + ' duplicate' + (skippedCount === 1 ? '' : 's');
+        if (autoFixCount > 0) msg += ' · Auto-fixed ' + autoFixCount + ' SKUs (+' + autoFixTotalPcs + ' pcs opening stock)';
+        if (typeof toast === 'function') toast(msg);
+
+      } catch (err) {
+        if (isBig && typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+        console.error('[v2-storage] confirmUpload failed:', err);
+        alert('⚠️ Upload save fail ho gaya!\n\nDetails: ' + (err.message || err) + '\n\nPage refresh karo aur dobara try karo. Aapka data safe hai.');
+        // Reload from cloud to get back to consistent state
+        try { await window.loadData(); } catch (e) {}
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: saveVelocitySettings
+    // ============================================================
+    window.saveVelocitySettings = async function v2SaveVelocitySettings() {
+      const vd = parseFloat(document.getElementById('set-vd').value);
+      const vp = parseFloat(document.getElementById('set-vp').value);
+      const rm = parseFloat(document.getElementById('set-rm').value);
+      if (isNaN(vd) || vd < 1) { alert('Window kam se kam 1 day hona chahiye'); return; }
+      if (isNaN(vp) || vp < 1 || vp > 100) { alert('Threshold 1-100 ke beech mein hona chahiye'); return; }
+      if (isNaN(rm) || rm < 1) { alert('Multiplier kam se kam 1 hona chahiye'); return; }
+
+      const prev = { vd: settings.velocityDays, vp: settings.velocityPct, rm: settings.fastMoverMultiplier };
+      settings.velocityDays = vd;
+      settings.velocityPct = vp;
+      settings.fastMoverMultiplier = rm;
+
+      try {
+        await cloudSaveSetting('velocityDays', vd);
+        await cloudSaveSetting('velocityPct', vp);
+        await cloudSaveSetting('fastMoverMultiplier', rm);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast('✓ ' + vp + '% in ' + vd + ' days · fast movers ' + rm + '×');
+      } catch (err) {
+        settings.velocityDays = prev.vd;
+        settings.velocityPct = prev.vp;
+        settings.fastMoverMultiplier = prev.rm;
+        console.error('[v2-storage] saveVelocitySettings failed:', err);
+        alert('Settings save fail — internet check karo.');
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: addUserAccess / removeUserAccess / changeUserPassword
+    // ============================================================
+    // Users are stored in app_settings_v2 under key='users'
+    // ============================================================
+    async function persistUsers() {
+      return cloudSaveSetting('users', settings.users || {});
+    }
+
+    window.addUserAccess = async function v2AddUserAccess() {
+      if (typeof canManageUsers === 'function' && !canManageUsers()) {
+        alert('Sirf Admin user add kar sakte hain.'); return;
+      }
+      const usernameInput = document.getElementById('new-user-email');
+      const passwordInput = document.getElementById('new-user-password');
+      const roleSelect = document.getElementById('new-user-role');
+      const username = (usernameInput.value || '').trim().toLowerCase();
+      const password = passwordInput ? passwordInput.value : '';
+      const role = roleSelect.value;
+
+      if (!username) { alert('Username daalo'); return; }
+      if (!/^[a-z0-9_]+$/.test(username)) {
+        alert('Username mein sirf lowercase letters, numbers, aur _ chal sakte hain'); return;
+      }
+      if (!password || password.length < 4) {
+        alert('Password kam se kam 4 chars'); return;
+      }
+
+      const users = (typeof getUsersTable === 'function') ? getUsersTable() : (settings.users = settings.users || {});
+      if (users[username]) {
+        if (!confirm('Username "' + username + '" pehle se hai. Update karna hai?')) return;
+      }
+      users[username] = { password: password, role: role, isOwner: false };
+
+      try {
+        await persistUsers();
+        if (typeof renderUsersList === 'function') renderUsersList();
+        usernameInput.value = '';
+        if (passwordInput) passwordInput.value = '';
+        if (typeof toast === 'function') toast('✓ ' + username + ' (' + role + ') add ho gaya');
+      } catch (err) {
+        delete users[username];
+        console.error('[v2-storage] addUserAccess failed:', err);
+        alert('Save fail — internet check karo.');
+      }
+    };
+
+    window.removeUserAccess = async function v2RemoveUserAccess(username) {
+      if (typeof canManageUsers === 'function' && !canManageUsers()) {
+        alert('Sirf Admin remove kar sakte hain.'); return;
+      }
+      const users = (typeof getUsersTable === 'function') ? getUsersTable() : (settings.users || {});
+      const info = users[username];
+      if (!info) return;
+      if (info.isOwner) { alert('Owner ko remove nahi kar sakte.'); return; }
+      if (username === currentUser) { alert('Apne aap ko remove nahi kar sakte.'); return; }
+      if (!confirm(username + ' ka access remove karna hai?')) return;
+
+      const backup = users[username];
+      delete users[username];
+      try {
+        await persistUsers();
+        if (typeof renderUsersList === 'function') renderUsersList();
+        if (typeof toast === 'function') toast('✓ ' + username + ' remove ho gaya');
+      } catch (err) {
+        users[username] = backup;
+        console.error('[v2-storage] removeUserAccess failed:', err);
+        alert('Save fail — internet check karo.');
+      }
+    };
+
+    window.changeUserPassword = async function v2ChangeUserPassword(username) {
+      if (typeof canManageUsers === 'function' && !canManageUsers() && username !== currentUser) {
+        alert('Sirf Admin doosron ka password change kar sakte hain.'); return;
+      }
+      const users = (typeof getUsersTable === 'function') ? getUsersTable() : (settings.users || {});
+      const info = users[username];
+      if (!info) return;
+      const newPwd = prompt(username + ' ka naya password daalo:', '');
+      if (newPwd === null) return;
+      if (!newPwd || newPwd.length < 4) { alert('Password kam se kam 4 chars'); return; }
+      const oldPwd = info.password;
+      info.password = newPwd;
+      try {
+        await persistUsers();
+        if (typeof renderUsersList === 'function') renderUsersList();
+        if (typeof toast === 'function') toast('✓ ' + username + ' ka password change ho gaya');
+      } catch (err) {
+        info.password = oldPwd;
+        console.error('[v2-storage] changeUserPassword failed:', err);
+        alert('Save fail — internet check karo.');
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: wipeData
+    // ============================================================
+    window.wipeData = async function v2WipeData() {
+      if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Deleting all data...');
+      try {
+        await cloudWipeAll();
+        suppliers = [];
+        brands = [];
+        items = [];
+        transactions = [];
+        // Keep settings (velocity + users) — restore default values for velocity
+        settings = Object.assign({}, settings, { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 });
+        await cloudSaveSetting('velocityDays', 20);
+        await cloudSaveSetting('velocityPct', 75);
+        await cloudSaveSetting('fastMoverMultiplier', 2);
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof toast === 'function') toast('All data deleted');
+      } catch (err) {
+        console.error('[v2-storage] wipeData failed:', err);
+        alert('Wipe fail — internet check karo. Details: ' + (err.message || err));
+      } finally {
+        if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: handleRestoreFile
+    // ============================================================
+    // Restore from backup JSON — wipes _v2 tables then bulk inserts.
+    // ============================================================
+    window.handleRestoreFile = function v2HandleRestoreFile(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const backup = JSON.parse(e.target.result);
+          if (!backup || !backup.data) {
+            alert('Galat backup file. Is app ka backup nahi lagta.');
+            event.target.value = '';
+            return;
+          }
+          const d = backup.data;
+          const newSuppliers = d.suppliers || [];
+          const newBrands = d.brands || [];
+          const newItems = d.items || [];
+          const newTransactions = d.transactions || [];
+          const newSettings = d.settings || { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+
+          const stats = newSuppliers.length + ' suppliers, ' + newBrands.length + ' brands, ' +
+                        newItems.length + ' SKUs, ' + newTransactions.length.toLocaleString() + ' transactions';
+          if (!confirm('Backup mein hai: ' + stats + '\n\nKya REPLACE karna hai? Abhi ka data hat jayega.')) {
+            event.target.value = '';
+            return;
+          }
+
+          if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Wiping current data...');
+          await cloudWipeAll();
+
+          if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Restoring suppliers...');
+          await cloudInsertEntitiesBatch('suppliers_v2', newSuppliers.map(toRowSupplier));
+
+          if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Restoring brands...');
+          await cloudInsertEntitiesBatch('brands_v2', newBrands.map(toRowBrand));
+
+          if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Restoring SKUs...');
+          await cloudInsertEntitiesBatch('items_v2', newItems.map(toRowItem));
+
+          // Validate transactions against item IDs (skip orphans)
+          const validItemIds = new Set(newItems.map(i => i.id));
+          const cleanTx = newTransactions.filter(t => t.itemId && validItemIds.has(t.itemId));
+          const orphanCount = newTransactions.length - cleanTx.length;
+          if (orphanCount > 0) console.warn('[v2-storage] Skipping ' + orphanCount + ' orphan transactions during restore');
+
+          if (typeof showLoadingOverlay === 'function') {
+            showLoadingOverlay('Restoring transactions (0 / ' + cleanTx.length.toLocaleString() + ')...');
+          }
+          await cloudInsertTransactionsBatch(cleanTx, (done, total) => {
+            if (typeof showLoadingOverlay === 'function') {
+              showLoadingOverlay('Restoring transactions (' + done.toLocaleString() + ' / ' + total.toLocaleString() + ')...');
+            }
+          });
+
+          if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Restoring settings...');
+          if (newSettings.velocityDays != null) await cloudSaveSetting('velocityDays', Number(newSettings.velocityDays));
+          if (newSettings.velocityPct != null) await cloudSaveSetting('velocityPct', Number(newSettings.velocityPct));
+          if (newSettings.fastMoverMultiplier != null) await cloudSaveSetting('fastMoverMultiplier', Number(newSettings.fastMoverMultiplier));
+          if (newSettings.users) await cloudSaveSetting('users', newSettings.users);
+
+          // Reload everything from cloud
+          await window.loadData();
+
+          if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+          let toastMsg = '✓ Restore complete — ' + stats;
+          if (orphanCount > 0) toastMsg += ' (skipped ' + orphanCount + ' orphan tx)';
+          if (typeof toast === 'function') toast(toastMsg);
+        } catch (err) {
+          if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+          console.error('[v2-storage] restore failed:', err);
+          alert('Restore fail ho gaya:\n\n' + (err.message || err) + '\n\nPage refresh karo.');
+        }
+        event.target.value = '';
+      };
+      reader.onerror = () => alert('File padhne mein error.');
+      reader.readAsText(file);
+    };
+
+    // ============================================================
+    // OVERRIDE: fixNegativeStock
+    // ============================================================
+    window.fixNegativeStock = async function v2FixNegativeStock() {
+      if (typeof canEdit === 'function' && !canEdit()) {
+        alert('Sirf Admin/Manager ye kar sakte hain.'); return;
+      }
+      if (typeof bumpDataVersion === 'function') bumpDataVersion();
+      if (typeof buildStockCache === 'function') buildStockCache();
+
+      const negativeItems = [];
+      items.forEach(item => {
+        const stock = (typeof getStock === 'function') ? getStock(item.id) : 0;
+        if (stock < 0) negativeItems.push({ item: item, deficit: Math.abs(stock) });
+      });
+
+      if (negativeItems.length === 0) {
+        alert('✓ Koi negative stock nahi hai.');
+        return;
+      }
+
+      const totalDeficit = negativeItems.reduce((s, n) => s + n.deficit, 0);
+      const msg = negativeItems.length + ' SKUs mein negative stock hai.\n\n' +
+                  'Total ' + totalDeficit + ' pieces ka opening stock add hoga.\n\nContinue?';
+      if (!confirm(msg)) return;
+
+      if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Fixing negative stock...');
+      try {
+        for (const n of negativeItems) {
+          n.item.startStock = (Number(n.item.startStock) || 0) + n.deficit;
+          await cloudUpsertItem(n.item);
+        }
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof switchTab === 'function') switchTab('livestock');
+        if (typeof toast === 'function') toast('✓ Fixed ' + negativeItems.length + ' SKUs (+' + totalDeficit + ' pcs)');
+      } catch (err) {
+        // Rollback in-memory
+        negativeItems.forEach(n => { n.item.startStock = (Number(n.item.startStock) || 0) - n.deficit; });
+        console.error('[v2-storage] fixNegativeStock failed:', err);
+        alert('Fix save nahi hua. Internet check karo.');
+      } finally {
+        if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: tagReturnsInOldData
+    // ============================================================
+    // The detection logic is preserved as-is from the original.
+    // We only override the persistence step (cloud update).
+    // ============================================================
+    window.tagReturnsInOldData = async function v2TagReturnsInOldData() {
+      if (typeof canEdit === 'function' && !canEdit()) {
+        alert('Sirf Admin/Manager ye kar sakte hain.'); return;
+      }
+
+      // Replicate detection logic (kept identical to original for safety)
+      const itemStats = new Map();
+      transactions.forEach(t => {
+        if (!itemStats.has(t.itemId)) itemStats.set(t.itemId, { ins: [], outs: [], totalIn: 0, totalOut: 0 });
+        const s = itemStats.get(t.itemId);
+        if (t.type === 'In') { s.ins.push(t); s.totalIn += Number(t.qty); }
+        else { s.outs.push(t); s.totalOut += Number(t.qty); }
+      });
+
+      const outKeys = new Set();
+      transactions.forEach(t => {
+        if (t.type === 'Out' && t.note) outKeys.add(t.itemId + '|' + t.note.trim());
+      });
+
+      const candidates = new Set();
+      transactions.forEach(t => {
+        if (t.type !== 'In') return;
+        if (!t.note) return;
+        const noteClean = t.note.trim();
+        if (noteClean.includes('[RETURN]')) return;
+        const key = t.itemId + '|' + noteClean;
+        if (outKeys.has(key)) candidates.add(t);
+      });
+
+      itemStats.forEach((stats) => {
+        if (stats.ins.length < 2) return;
+        const sortedIns = stats.ins.slice().sort((a, b) => Number(b.qty) - Number(a.qty));
+        const largest = Number(sortedIns[0].qty);
+        if (largest < 10) return;
+        const threshold = Math.min(5, Math.floor(largest / 3));
+        sortedIns.forEach((t, idx) => {
+          if (idx === 0) return;
+          if (Number(t.qty) > threshold) return;
+          if (t.note && t.note.includes('[RETURN]')) return;
+          candidates.add(t);
+        });
+      });
+
+      items.forEach(item => {
+        const stats = itemStats.get(item.id);
+        if (!stats) return;
+        const hasLargePurchase = stats.ins.some(t => Number(t.qty) >= 6);
+        if (!hasLargePurchase && stats.ins.length > 0) {
+          stats.ins.forEach(t => {
+            if (t.note && t.note.includes('[RETURN]')) return;
+            candidates.add(t);
+          });
+        }
+      });
+
+      if (candidates.size === 0) {
+        alert('✓ Koi untagged returns nahi mila.');
+        return;
+      }
+
+      const candidatesArr = Array.from(candidates);
+      const totalReturnQty = candidatesArr.reduce((s, t) => s + Number(t.qty), 0);
+      const msg = candidatesArr.length + ' return transactions detected (' + totalReturnQty + ' pcs).\n\nContinue?';
+      if (!confirm(msg)) return;
+
+      if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Tagging returns...');
+      try {
+        // Build the updates
+        const originalNotes = new Map();
+        candidatesArr.forEach(t => {
+          originalNotes.set(t.id, t.note);
+          t.note = (t.note || '').trim() + ' [RETURN]';
+        });
+
+        // Push updates to cloud in small batches via upsert
+        const BATCH = 100;
+        for (let i = 0; i < candidatesArr.length; i += BATCH) {
+          const batch = candidatesArr.slice(i, i + BATCH).map(toRowTransaction);
+          await cloudExec(async () => {
+            const { error } = await db.from('transactions_v2').upsert(batch);
+            if (error) throw error;
+          }, 'tagReturns-batch-' + i);
+          if (typeof showLoadingOverlay === 'function') {
+            showLoadingOverlay('Tagging returns... (' + Math.min(i + BATCH, candidatesArr.length) + '/' + candidatesArr.length + ')');
+          }
+        }
+
+        if (typeof bumpDataVersion === 'function') bumpDataVersion();
+        if (typeof renderAll === 'function') renderAll();
+        if (typeof switchTab === 'function') switchTab('livestock');
+        if (typeof toast === 'function') toast('✓ Tagged ' + candidatesArr.length + ' returns (' + totalReturnQty + ' pcs)');
+      } catch (err) {
+        console.error('[v2-storage] tagReturnsInOldData failed:', err);
+        alert('Save fail. Internet check karo.');
+        // Reload from cloud to get back to consistent state
+        try { await window.loadData(); } catch (e) {}
+      } finally {
+        if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      }
+    };
+
+    // ============================================================
+    // OVERRIDE: resetAndGuide
+    // ============================================================
+    // Calls wipeData (now v2-aware) and shows the same guide modal.
+    // ============================================================
+    // (No override needed — it calls wipeData() which we've already overridden.)
+
+    // ============================================================
+    // OVERRIDE: loadSampleData
+    // ============================================================
+    // Used only on first-ever load when database is empty.
+    // ============================================================
+    const originalLoadSampleData = window.loadSampleData;
+    window.loadSampleData = async function v2LoadSampleData(showMsg) {
+      // Call original to populate the in-memory arrays with sample data
+      if (typeof originalLoadSampleData !== 'function') return;
+      // Original's logic: builds suppliers/brands/items/transactions in memory then calls saveAll.
+      // We need to insert them to cloud instead.
+
+      // Temporarily replace saveAll to capture the data after original builds it
+      const realSaveAll = window.saveAll;
+      window.saveAll = async function() {
+        // Do nothing — we'll do cloud insert below
+        return Promise.resolve();
+      };
+
+      try {
+        await originalLoadSampleData.call(this, false);
+        // Now push to cloud
+        await cloudInsertEntitiesBatch('suppliers_v2', suppliers.map(toRowSupplier));
+        await cloudInsertEntitiesBatch('brands_v2', brands.map(toRowBrand));
+        await cloudInsertEntitiesBatch('items_v2', items.map(toRowItem));
+        await cloudInsertTransactionsBatch(transactions);
+        await cloudSaveSetting('velocityDays', settings.velocityDays);
+        await cloudSaveSetting('velocityPct', settings.velocityPct);
+        await cloudSaveSetting('fastMoverMultiplier', settings.fastMoverMultiplier);
+        if (showMsg && typeof toast === 'function') toast('Sample data loaded');
+      } finally {
+        window.saveAll = realSaveAll;
+      }
+      if (typeof renderAll === 'function') renderAll();
+    };
+
+    console.log('✅ [v2-storage] All function overrides applied successfully.');
+    console.log('   - loadData → reads from 5 _v2 tables');
+    console.log('   - saveAll → no-op (each CRUD syncs directly)');
+    console.log('   - CRUD ops → direct cloud writes (no more 16 MB blobs)');
+    console.log('   - Excel uploads → batched inserts (500 tx per batch)');
+    console.log('   - Restore → wipe + batch insert from backup JSON');
+  }
+
+  console.log('📦 V2 storage patch loaded — waiting for original functions...');
+})();
+</script>
+<!-- END V2 PATCH -->
