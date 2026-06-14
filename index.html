@@ -7374,3 +7374,248 @@
 })();
 </script>
 <!-- END FINAL-FIX -->
+<!--
+  ============================================================
+  ⚡ SPEED FIX — Parallel Pagination
+  ============================================================
+
+  PROBLEM:
+  ─────────────────────────
+  Final-fix patch sequential pagination karta hai (ek-ek request).
+  Tumhara data: 11,901 items + 75,756 transactions = 88 requests.
+  88 × 1.5 sec = ~120 sec login time. BAHUT SLOW.
+
+  YE PATCH KARTA HAI:
+  ─────────────────────────
+  ✅ 8 requests EK SAATH parallel bhejta hai
+  ✅ Saari 5 tables (sup, br, items, settings, tx) parallel load karta hai
+  ✅ Result: ~15-20 sec login (6x faster!)
+  ✅ Auto-reload after patch loads — refresh ki zaroorat nahi
+
+  KAISE LAGAYE:
+  ─────────────────────────
+  1. GitHub mein index.html kholo
+  2. Ctrl + End (file ke end mein jao)
+  3. Last line dhundo: <!-- END FINAL-FIX -->
+  4. Uske TURANT BAAD ye saara block paste karo
+  5. Commit changes 2 baar dabao
+  6. 1-2 min wait, fir hard refresh (Ctrl + Shift + R)
+
+  IMPORTANT: Pichli patches (FINAL-FIX wagairah) DELETE MAT karo!
+  ============================================================
+-->
+
+<!-- START SPEED-FIX -->
+<script>
+/**
+ * Retail Garments IMS — SPEED Fix Patch
+ *
+ * Fires multiple page requests in parallel instead of one-at-a-time.
+ * Reduces login time from ~120 sec to ~15-20 sec for 75k+ transactions.
+ */
+(function() {
+  'use strict';
+  console.log('⚡ SPEED fix patch loading...');
+
+  const PAGE_SIZE = 1000;         // Matches Supabase default max-rows
+  const CONCURRENCY = 8;          // 8 parallel requests per batch
+  const MAX_RETRIES = 3;
+
+  // Single page fetch with retry
+  async function fetchPage(table, from, to, order) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        if (attempt > 1) await new Promise(r => setTimeout(r, attempt * 500));
+        let q = db.from(table).select('*');
+        if (order) q = q.order(order, { ascending: true });
+        q = q.range(from, to);
+        const { data, error } = await q;
+        if (error) { lastError = error; continue; }
+        return data || [];
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw new Error('Page ' + from + '-' + to + ' of ' + table + ' failed: ' +
+                    (lastError && lastError.message || 'unknown'));
+  }
+
+  // Get exact count for a table
+  async function getCount(table) {
+    const { count, error } = await db.from(table).select('*', { count: 'exact', head: true });
+    if (error) throw new Error('Count of ' + table + ' failed: ' + error.message);
+    return count || 0;
+  }
+
+  // Parallel paginated fetch
+  async function paginateFast(table, opts) {
+    opts = opts || {};
+    const count = await getCount(table);
+    if (count === 0) return [];
+
+    const totalPages = Math.ceil(count / PAGE_SIZE);
+    const all = new Array(count);
+    let completedPages = 0;
+
+    for (let batchStart = 0; batchStart < totalPages; batchStart += CONCURRENCY) {
+      const batchEnd = Math.min(batchStart + CONCURRENCY, totalPages);
+      const promises = [];
+      for (let i = batchStart; i < batchEnd; i++) {
+        const fromIdx = i * PAGE_SIZE;
+        const toIdx = fromIdx + PAGE_SIZE - 1;
+        promises.push(
+          fetchPage(table, fromIdx, toIdx, opts.order)
+            .then(data => ({ index: i, data: data }))
+        );
+      }
+      const results = await Promise.all(promises);
+      for (const r of results) {
+        const offset = r.index * PAGE_SIZE;
+        for (let j = 0; j < r.data.length; j++) {
+          all[offset + j] = r.data[j];
+        }
+        completedPages++;
+      }
+
+      // Progress update for big tables
+      if ((table === 'items_v2' || table === 'transactions_v2') &&
+          typeof showLoadingOverlay === 'function') {
+        const loaded = Math.min(completedPages * PAGE_SIZE, count);
+        showLoadingOverlay('⚡ ' + table.replace('_v2', '') + '... ' +
+                           loaded.toLocaleString() + '/' + count.toLocaleString());
+      }
+    }
+
+    // Filter out any undefined slots (shouldn't happen but safe)
+    return all.filter(x => x !== undefined);
+  }
+
+  // Expose for other code
+  window.__paginateFast = paginateFast;
+
+  // Row converters
+  function rowToSup(r) {
+    return {
+      id: r.id, name: r.name || '', contact: r.contact || '',
+      phone: r.phone || '', notes: r.notes || '', lt: r.lt, sf: r.sf
+    };
+  }
+  function rowToBr(r) {
+    return { id: r.id, name: r.name || '', supplierId: r.supplier_id };
+  }
+  function rowToIt(r) {
+    return {
+      id: r.id, name: r.name || '', brandId: r.brand_id,
+      category: r.category || '', size: r.size || '', color: r.color || '',
+      cost: Number(r.cost) || 0, sell: Number(r.sell) || 0,
+      adc: Number(r.adc) || 0, moq: Number(r.moq) || 0,
+      max: Number(r.max_level) || 0, startStock: Number(r.start_stock) || 0
+    };
+  }
+
+  // SPEED loadData — fires ALL 5 tables in parallel, each with parallel pagination
+  async function speedLoadData() {
+    if (!db) {
+      alert('Supabase ready nahi. Page reload karo.');
+      return;
+    }
+    if (typeof showLoadingOverlay === 'function') {
+      showLoadingOverlay('⚡ Fast loading (parallel)...');
+    }
+    const startTime = Date.now();
+    try {
+      // BIGGEST SPEEDUP: All 5 table fetches happen at the same time
+      const [supData, brData, itemsData, settingsRes, txData] = await Promise.all([
+        paginateFast('suppliers_v2'),
+        paginateFast('brands_v2'),
+        paginateFast('items_v2', { order: 'id' }),
+        db.from('app_settings_v2').select('*'),
+        paginateFast('transactions_v2', { order: 'ts' })
+      ]);
+
+      if (settingsRes.error) {
+        throw new Error('app_settings_v2: ' + settingsRes.error.message);
+      }
+      const settingsData = settingsRes.data || [];
+
+      suppliers = supData.map(rowToSup);
+      brands = brData.map(rowToBr);
+      items = itemsData.map(rowToIt);
+      transactions = txData.map(r => ({
+        id: r.id, itemId: r.item_id, type: r.type,
+        qty: Number(r.qty) || 0, note: r.note || '', ts: Number(r.ts)
+      }));
+
+      settings = { velocityDays: 20, velocityPct: 75, fastMoverMultiplier: 2 };
+      settingsData.forEach(row => {
+        const v = row.value;
+        if (row.key === 'velocityDays' || row.key === 'velocityPct' || row.key === 'fastMoverMultiplier') {
+          settings[row.key] = (v && typeof v === 'object' && 'value' in v) ? Number(v.value) : Number(v);
+        } else if (row.key === 'users') {
+          settings.users = v || {};
+        } else {
+          settings[row.key] = v;
+        }
+      });
+
+      isOnline = true;
+      if (typeof bumpDataVersion === 'function') bumpDataVersion();
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log('⚡ [speed] Loaded in ' + elapsed + 's — ' +
+                  suppliers.length + ' suppliers, ' +
+                  brands.length + ' brands, ' +
+                  items.length + ' SKUs, ' +
+                  transactions.length + ' transactions');
+
+      if (!settings.users || Object.keys(settings.users).length === 0) {
+        if (typeof DEFAULT_USERS !== 'undefined') {
+          settings.users = JSON.parse(JSON.stringify(DEFAULT_USERS));
+          try {
+            await db.from('app_settings_v2').upsert({
+              key: 'users', value: settings.users,
+              updated_at: new Date().toISOString()
+            });
+          } catch (e) {}
+        }
+      }
+    } catch (err) {
+      console.error('[speed] loadData failed:', err);
+      alert('Cloud se data load nahi hua.\n\nDetails: ' + (err.message || err));
+      isOnline = false;
+    } finally {
+      if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay();
+      if (typeof renderAll === 'function') renderAll();
+    }
+  }
+
+  // Apply override — must win over all earlier patches
+  let attempts = 0;
+  const interval = setInterval(() => {
+    attempts++;
+    if (typeof window.loadData === 'function' && !window.loadData._speedV1) {
+      window.loadData = speedLoadData;
+      window.loadData._speedV1 = true;
+      console.log('⚡ [speed] loadData → parallel pagination (8 concurrent, all tables parallel)');
+      clearInterval(interval);
+    }
+    if (attempts > 100) {
+      clearInterval(interval);
+      console.warn('[speed] Could not apply override after 10s');
+    }
+  }, 100);
+
+  // Auto-reload to apply speedup immediately
+  setTimeout(() => {
+    if (typeof window.loadData === 'function' && window.loadData._speedV1 &&
+        typeof currentUser !== 'undefined' && currentUser) {
+      console.log('⚡ [speed] Auto-reloading with parallel pagination...');
+      window.loadData();
+    }
+  }, 2000);
+
+  console.log('⚡ SPEED fix patch loaded — applying override...');
+})();
+</script>
+<!-- END SPEED-FIX -->
